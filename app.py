@@ -10,6 +10,7 @@ import sqlite3
 import streamlit as st
 import pandas as pd
 import numpy as np
+from utils.ai_model import optimiser_poids_ia_automatique
 
 # --- CONFIGURATION DES LOGS (Doit être en premier) ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
