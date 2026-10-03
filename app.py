@@ -93,8 +93,23 @@ def test_significativite_monte_carlo(paris_regles, iterations=10000):
 def verifier_resultats_automatiques_pmu(historique):
     modifie = False
     dates_modifiees = set()
-    # On cible tous les paris en attente sans limitation de lot
-    paris_en_attente = [p for p in historique if p.get("statut") == "En attente"]
+    
+    # Date du jour pour filtrer et ignorer les paris futurs qui n'ont pas encore de résultat
+    aujourdhui = datetime.date.today()
+    
+    # On cible les paris en attente dont la date est passée ou d'aujourd'hui
+    paris_en_attente = []
+    for p in historique:
+        if p.get("statut") == "En attente":
+            date_pari_str = str(p.get("date", ""))[:10]
+            try:
+                dt_pari = datetime.datetime.strptime(date_pari_str, "%Y-%m-%d").date()
+                if dt_pari <= aujourdhui:
+                    paris_en_attente.append(p)
+            except Exception:
+                # Si le format de date est atypique, on l'inclut par précaution
+                paris_en_attente.append(p)
+
     total_a_verifier = len(paris_en_attente)
     if total_a_verifier == 0:
         return False
@@ -103,7 +118,7 @@ def verifier_resultats_automatiques_pmu(historique):
     i = 0
     for p in paris_en_attente:  # On boucle directement sur la liste restreinte de paris en attente
         i += 1
-        progress_bar.progress(min(1.0, i / total_a_verifier), text=f"Vérification pari {i}/{total_a_verifier}...")
+        progress_bar.progress(min(1.0, i / total_a_verifier), text=f"Vérification pari {i}/{total_a_verifier} ({p.get('date', '')})...")
         
         # Sauvegarde automatique toutes les 100 analyses
         if i % 100 == 0 and modifie:
@@ -159,6 +174,8 @@ def verifier_resultats_automatiques_pmu(historique):
 
             partants_arrives.sort(key=lambda x: x[0])
             arrivee_trouvee = [num for _, num in partants_arrives]
+            
+            # Si les résultats/arrivées ne sont pas encore disponibles, on laisse en attente et on continue
             if not arrivee_trouvee:
                 continue
 
@@ -215,8 +232,9 @@ def verifier_resultats_automatiques_pmu(historique):
 
             modifie = True
             dates_modifiees.add(date_iso_norm)
-        except Exception:
-            pass
+        except Exception as e:
+            # En cas de coupure réseau ou d'erreur sur un pari, on ignore proprement et on continue la boucle
+            continue
 
     progress_bar.empty()
     return modifie
