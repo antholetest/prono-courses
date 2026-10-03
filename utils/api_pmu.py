@@ -73,7 +73,7 @@ def detecter_etat_terrain(conditions_texte):
             else "Souple"
         )
     return "Bon (Standard)"
-
+@st.cache_data
 def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
     try:
         dt = datetime.datetime.strptime(date_iso, "%Y-%m-%d")

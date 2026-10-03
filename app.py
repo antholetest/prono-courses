@@ -10,6 +10,7 @@ import sqlite3
 import streamlit as st
 import pandas as pd
 import numpy as np
+from datetime import timedelta
 from utils.ai_model import optimiser_poids_ia_automatique
 
 # --- CONFIGURATION DES LOGS (Doit être en premier) ---
@@ -92,6 +93,7 @@ def test_significativite_monte_carlo(paris_regles, iterations=10000):
 def verifier_resultats_automatiques_pmu(historique):
     modifie = False
     dates_modifiees = set()
+    # On cible tous les paris en attente sans limitation de lot
     paris_en_attente = [p for p in historique if p.get("statut") == "En attente"]
     total_a_verifier = len(paris_en_attente)
     if total_a_verifier == 0:
@@ -99,115 +101,122 @@ def verifier_resultats_automatiques_pmu(historique):
 
     progress_bar = st.progress(0, text="Vérification des résultats PMU...")
     i = 0
-    for p in historique:
-        if p.get("statut") == "En attente":
-            i += 1
-            progress_bar.progress(min(1.0, i / total_a_verifier), text=f"Vérification pari {i}/{total_a_verifier}...")
-            date_pari = str(p.get("date", "")).strip()
-            reunion_raw = str(p.get("reunion", "")).strip()
-            course_raw = str(p.get("course_num", "")).strip()
-            course_full = str(p.get("course", "")).strip()
+    for p in paris_en_attente:  # On boucle directement sur la liste restreinte de paris en attente
+        i += 1
+        progress_bar.progress(min(1.0, i / total_a_verifier), text=f"Vérification pari {i}/{total_a_verifier}...")
+        
+        # Sauvegarde automatique toutes les 100 analyses
+        if i % 100 == 0 and modifie:
+            st.toast(f"Sauvegarde automatique intermédiaire : {i}/{total_a_verifier} paris traités.", icon="💾")
+            # Si votre script stocke l'historique dans le session_state :
+            if "historique" in st.session_state:
+                st.session_state["historique"] = historique
 
-            date_pmu, date_iso_norm = None, date_pari
-            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-                try:
-                    dt = datetime.datetime.strptime(date_pari, fmt)
-                    date_pmu = dt.strftime("%d%m%Y")
-                    date_iso_norm = dt.strftime("%Y-%m-%d")
-                    break
-                except Exception:
-                    pass
-            if not date_pmu:
-                continue
+        date_pari = str(p.get("date", "")).strip()
+        reunion_raw = str(p.get("reunion", "")).strip()
+        course_raw = str(p.get("course_num", "")).strip()
+        course_full = str(p.get("course", "")).strip()
 
-            texte_global = f"{reunion_raw} {course_raw} {course_full}"
-            r_match = re.search(r"R\s*(\d+)", texte_global, re.IGNORECASE)
-            reunion_str = f"R{r_match.group(1)}" if r_match else ""
-            c_match = re.search(r"C\s*(\d+)", texte_global, re.IGNORECASE)
-            if not c_match:
-                c_match = re.search(r"\b(\d+)(?:ère|ème|e)?\s*course\b", texte_global, re.IGNORECASE)
-            course_str = f"C{c_match.group(1)}" if c_match else ""
-
-            if not reunion_str or not course_str:
-                continue
-
+        date_pmu, date_iso_norm = None, date_pari
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
             try:
-                res_rap = requests.get(f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{reunion_str}/{course_str}/rapports", headers=HEADERS, timeout=10)
-                res_part = requests.get(f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{reunion_str}/{course_str}/participants", headers=HEADERS, timeout=10)
-                if res_part.status_code != 200:
-                    continue
-
-                liste_partants_bruts = res_part.json().get("participants", [])
-                cotes_reelles, partants_arrives = {}, []
-                for part in liste_partants_bruts:
-                    num_pmu = str(part.get("numPmu"))
-                    rapport = part.get("dernierRapportDirect")
-                    if isinstance(rapport, dict) and isinstance(rapport.get("rapport"), (int, float)):
-                        cotes_reelles[num_pmu] = float(rapport.get("rapport"))
-                    ordre = part.get("ordreArrivee")
-                    if isinstance(ordre, int) and ordre > 0:
-                        partants_arrives.append((ordre, num_pmu))
-
-                partants_arrives.sort(key=lambda x: x[0])
-                arrivee_trouvee = [num for _, num in partants_arrives]
-                if not arrivee_trouvee:
-                    continue
-
-                details = str(p.get("details", ""))
-                mise_totale = safe_float(p.get("mise", 0))
-                gain_total, un_gagne = 0.0, False
-                parts = details.split("|") if "|" in details else [details]
-                limite_places = 3 if len(liste_partants_bruts) >= 8 else 2
-
-                for part in parts:
-                    part_lower = part.lower()
-                    nums_part = re.findall(r"N°\s*(\d+)", part)
-                    mise_part_m = re.search(r"\((\d+(?:[\.,]\d+)?)\s*€\)", part)
-                    mise_part = float(mise_part_m.group(1).replace(",", ".")) if mise_part_m else (mise_totale / len(parts))
-
-                    if ("placé" in part_lower or "place" in part_lower or "sécu" in part_lower) and nums_part:
-                        num_secu = str(nums_part[0])
-                        div_ref = max(1.1, 1.0 + (cotes_reelles.get(num_secu, 3.0) - 1.0) / (3.6 if len(liste_partants_bruts) >= 8 else 2.5))
-                        if num_secu in arrivee_trouvee[:limite_places]:
-                            gain_total += mise_part * div_ref
-                            un_gagne = True
-                    elif ("gagnant" in part_lower or "poker" in part_lower) and nums_part:
-                        num_poker = str(nums_part[0])
-                        div_ref = cotes_reelles.get(num_poker, 3.0)
-                        if num_poker == arrivee_trouvee[0]:
-                            gain_total += mise_part * div_ref
-                            un_gagne = True
-
-                p["statut"] = "Gagné" if un_gagne else "Perdu"
-                p["gain"] = round(gain_total, 2)
-                p["diagnostic"] = retroaction_apprentissage_ia(p, arrivee_trouvee, cotes_reelles, liste_partants_bruts)
-                
-                # --- Enregistrement de l'arrivée pour l'apprentissage LightGBM ---
-                try:
-                    conn_db = sqlite3.connect(DB_PATH)
-                    cur = conn_db.cursor()
-                    cur.execute("SELECT data_json FROM courses_cache WHERE date_iso = ? AND reunion = ? AND course = ?", 
-                                (date_iso_norm, reunion_str, course_str))
-                    row_cache = cur.fetchone()
-                    if row_cache:
-                        race_data = json.loads(row_cache[0])
-                        for part in race_data.get("chevaux", []):
-                            num_pmu_str = str(part.get("num"))
-                            for ord_num, p_num in partants_arrives:
-                                if num_pmu_str == p_num:
-                                    part["ordreArrivee"] = ord_num
-                        cur.execute("UPDATE courses_cache SET data_json = ? WHERE date_iso = ? AND reunion = ? AND course = ?",
-                                    (json.dumps(race_data, ensure_ascii=False), date_iso_norm, reunion_str, course_str))
-                        conn_db.commit()
-                    conn_db.close()
-                except Exception as e:
-                    logger.error(f"Erreur mise à jour ordre arrivée cache : {e}")
-                # --------------------------------------------------------------------------
-
-                modifie = True
-                dates_modifiees.add(date_iso_norm)
+                dt = datetime.datetime.strptime(date_pari, fmt)
+                date_pmu = dt.strftime("%d%m%Y")
+                date_iso_norm = dt.strftime("%Y-%m-%d")
+                break
             except Exception:
-                pass  # <--- C'est cette ligne qui fermait le try principal et manquait !
+                pass
+        if not date_pmu:
+            continue
+
+        texte_global = f"{reunion_raw} {course_raw} {course_full}"
+        r_match = re.search(r"R\s*(\d+)", texte_global, re.IGNORECASE)
+        reunion_str = f"R{r_match.group(1)}" if r_match else ""
+        c_match = re.search(r"C\s*(\d+)", texte_global, re.IGNORECASE)
+        if not c_match:
+            c_match = re.search(r"\b(\d+)(?:ère|ème|e)?\s*course\b", texte_global, re.IGNORECASE)
+        course_str = f"C{c_match.group(1)}" if c_match else ""
+
+        if not reunion_str or not course_str:
+            continue
+
+        try:
+            res_rap = requests.get(f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{reunion_str}/{course_str}/rapports", headers=HEADERS, timeout=10)
+            res_part = requests.get(f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{reunion_str}/{course_str}/participants", headers=HEADERS, timeout=10)
+            if res_part.status_code != 200:
+                continue
+
+            liste_partants_bruts = res_part.json().get("participants", [])
+            cotes_reelles, partants_arrives = {}, []
+            for part in liste_partants_bruts:
+                num_pmu = str(part.get("numPmu"))
+                rapport = part.get("dernierRapportDirect")
+                if isinstance(rapport, dict) and isinstance(rapport.get("rapport"), (int, float)):
+                    cotes_reelles[num_pmu] = float(rapport.get("rapport"))
+                ordre = part.get("ordreArrivee")
+                if isinstance(ordre, int) and ordre > 0:
+                    partants_arrives.append((ordre, num_pmu))
+
+            partants_arrives.sort(key=lambda x: x[0])
+            arrivee_trouvee = [num for _, num in partants_arrives]
+            if not arrivee_trouvee:
+                continue
+
+            details = str(p.get("details", ""))
+            mise_totale = safe_float(p.get("mise", 0))
+            gain_total, un_gagne = 0.0, False
+            parts = details.split("|") if "|" in details else [details]
+            limite_places = 3 if len(liste_partants_bruts) >= 8 else 2
+
+            for part in parts:
+                part_lower = part.lower()
+                nums_part = re.findall(r"N°\s*(\d+)", part)
+                mise_part_m = re.search(r"\((\d+(?:[\.,]\d+)?)\s*€\)", part)
+                mise_part = float(mise_part_m.group(1).replace(",", ".")) if mise_part_m else (mise_totale / len(parts))
+
+                if ("placé" in part_lower or "place" in part_lower or "sécu" in part_lower) and nums_part:
+                    num_secu = str(nums_part[0])
+                    div_ref = max(1.1, 1.0 + (cotes_reelles.get(num_secu, 3.0) - 1.0) / (3.6 if len(liste_partants_bruts) >= 8 else 2.5))
+                    if num_secu in arrivee_trouvee[:limite_places]:
+                        gain_total += mise_part * div_ref
+                        un_gagne = True
+                elif ("gagnant" in part_lower or "poker" in part_lower) and nums_part:
+                    num_poker = str(nums_part[0])
+                    div_ref = cotes_reelles.get(num_poker, 3.0)
+                    if num_poker == arrivee_trouvee[0]:
+                        gain_total += mise_part * div_ref
+                        un_gagne = True
+
+            p["statut"] = "Gagné" if un_gagne else "Perdu"
+            p["gain"] = round(gain_total, 2)
+            p["diagnostic"] = retroaction_apprentissage_ia(p, arrivee_trouvee, cotes_reelles, liste_partants_bruts)
+            
+            # --- Enregistrement de l'arrivée pour l'apprentissage LightGBM ---
+            try:
+                conn_db = sqlite3.connect(DB_PATH)
+                cur = conn_db.cursor()
+                cur.execute("SELECT data_json FROM courses_cache WHERE date_iso = ? AND reunion = ? AND course = ?", 
+                            (date_iso_norm, reunion_str, course_str))
+                row_cache = cur.fetchone()
+                if row_cache:
+                    race_data = json.loads(row_cache[0])
+                    for part in race_data.get("chevaux", []):
+                        num_pmu_str = str(part.get("num"))
+                        for ord_num, p_num in partants_arrives:
+                            if num_pmu_str == p_num:
+                                part["ordreArrivee"] = ord_num
+                    cur.execute("UPDATE courses_cache SET data_json = ? WHERE date_iso = ? AND reunion = ? AND course = ?",
+                                (json.dumps(race_data, ensure_ascii=False), date_iso_norm, reunion_str, course_str))
+                    conn_db.commit()
+                conn_db.close()
+            except Exception as e:
+                logger.error(f"Erreur mise à jour ordre arrivée cache : {e}")
+            # --------------------------------------------------------------------------
+
+            modifie = True
+            dates_modifiees.add(date_iso_norm)
+        except Exception:
+            pass
 
     progress_bar.empty()
     return modifie
@@ -581,7 +590,6 @@ with tab_admin:
                 nb_jours = delta.days + 1
                 
                 total_paris_ajoutes = 0
-                historique_actuel = charger_historique()
                 
                 for i in range(nb_jours):
                     courante_dt = date_debut + datetime.timedelta(days=i)
@@ -602,6 +610,8 @@ with tab_admin:
                         continue
                         
                     nb_courses_jour = 0
+                    paris_du_jour = []  # Liste temporaire pour accumuler les paris de cette seule journée
+                    
                     for c_elem in donnees_jour:
                         nom_c = str(c_elem.get("nom_course", "")).strip()
                         if not nom_c or nom_c.isdigit() or len(nom_c) <= 2:
@@ -646,13 +656,18 @@ with tab_admin:
                             "gain": 0.0,
                             "diagnostic": "",
                         }
-                        historique_actuel.append(nouveau_pari)
+                        paris_du_jour.append(nouveau_pari)
                         total_paris_ajoutes += 1
                         nb_courses_jour += 1
                         
-                    st.success(f"-> {nb_courses_jour} paris générés pour le {courante_iso}.")
+                    # 4. ENREGISTREMENT DIRECT DE LA JOURNÉE EN COURS
+                    if paris_du_jour:
+                        historique_actuel = charger_historique()
+                        historique_actuel.extend(paris_du_jour)
+                        sauvegarder_historique(historique_actuel)
+                        
+                    st.success(f"-> {nb_courses_jour} paris générés et enregistrés pour le {courante_iso}.")
                     
-                sauvegarder_historique(historique_actuel)
                 st.balloons()
                 st.success(f"🎉 Automatisation globale terminée avec succès ! {total_paris_ajoutes} paris au total ont été enregistrés.")
 
@@ -668,6 +683,53 @@ with tab_admin:
                 migrer_anciens_json_vers_sqlite()
                 st.success("Migration et initialisation de la base de données effectuées.")
 
+# --- NOUVELLE SECTION : NETTOYAGE DES PARIS EN ATTENTE EXPIRÉS ---
+        st.divider()
+        st.subheader("🧹 Nettoyage des Paris en Attente Expirés")
+        st.markdown("Supprimez automatiquement les paris restés **'En attente'** dont la date est trop ancienne et qui n'ont pas de résultat.")
+        
+        col_n1, col_n2 = st.columns([2, 1])
+        with col_n1:
+            nb_jours_del = st.number_input("Ancienneté minimale (en jours)", min_value=1, value=7, step=1, key="input_nb_jours_del_attente")
+        with col_n2:
+            st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+            if st.button("🗑️ Nettoyer les paris en attente", key="btn_nettoyer_attente_vieus"):
+                try:
+                    date_limite = datetime.date.today() - datetime.timedelta(days=int(nb_jours_del))
+                    date_limite_str = date_limite.strftime("%Y-%m-%d")
+                    
+                    # 1. Suppression directe dans la table SQLite 'paris'
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM paris WHERE statut = 'En attente' AND date < ?", (date_limite_str,))
+                    nb_supprimes = cursor.rowcount
+                    conn.commit()
+                    conn.close()
+                    
+                    # 2. Mise à jour de l'historique global (sécurité fichiers/JSON)
+                    hist = charger_historique()
+                    nouveaux_hist = []
+                    supp_hist_count = 0
+                    for p in hist:
+                        if p.get("statut") == "En attente":
+                            d_str = str(p.get("date", ""))[:10]
+                            try:
+                                if d_str and datetime.datetime.strptime(d_str, "%Y-%m-%d").date() < date_limite:
+                                    supp_hist_count += 1
+                                    continue
+                            except Exception:
+                                pass
+                        nouveaux_hist.append(p)
+                    
+                    if supp_hist_count > 0:
+                        sauvegarder_historique(nouveaux_hist)
+                    
+                    total_effectif = max(nb_supprimes, supp_hist_count)
+                    st.success(f"🧹 Nettoyage réussi : {total_effectif} pari(s) en attente de plus de {nb_jours_del} jours ont été supprimés.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Erreur lors du nettoyage des paris en attente : {e}")
+                    
         # --- NOUVELLE ZONE : REMISE À ZÉRO COMPLÈTE ---
         st.divider()
         st.subheader("⚠️ Zone Dangereuse : Remise à Zéro Complète")
