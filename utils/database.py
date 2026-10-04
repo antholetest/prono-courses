@@ -91,9 +91,7 @@ def migrer_anciens_json_vers_sqlite():
                             except Exception as e_pari:
                                 logger.error(f"Erreur insertion pari individuel : {e_pari}")
                     conn.commit()
-                    # Archivage sécurisé pour éviter de refaire la migration
-                    f_hist.replace(f_hist.with_name(f_hist.name + ".bak"))
-                    logger.info("Migration de l'historique des paris réussie. Fichier archivé en .bak")
+                    logger.info("Migration de l'historique des paris vers SQLite réussie.")
                 except Exception as e:
                     logger.error(f"Erreur migration historique globale : {e}")
 
@@ -113,13 +111,12 @@ def migrer_anciens_json_vers_sqlite():
                             except Exception as e_m:
                                 logger.error(f"Erreur insertion clé modèle IA {k}: {e_m}")
                     conn.commit()
-                    f_modele.replace(f_modele.with_name(f_modele.name + ".bak"))
-                    logger.info("Migration du modèle IA réussie. Fichier archivé en .bak")
+                    logger.info("Migration du modèle IA vers SQLite réussie.")
                 except Exception as e:
                     logger.error(f"Erreur migration modèle IA global : {e}")
 
         # 3. Migration pmu_du_jour_*.json
-        for f_json in list(DOSSIER.glob("pmu_du_jour_*.json")):
+        for f_json in DOSSIER.glob("pmu_du_jour_*.json"):
             try:
                 date_iso = f_json.stem.replace("pmu_du_jour_", "")
                 with open(f_json, "r", encoding="utf-8") as f:
@@ -132,12 +129,11 @@ def migrer_anciens_json_vers_sqlite():
                             VALUES (?, ?, ?, ?)
                         """, (date_iso, reunion, course_num, json.dumps(course, ensure_ascii=False)))
                 conn.commit()
-                f_json.replace(f_json.with_name(f_json.name + ".bak"))
             except Exception as e:
                 logger.error(f"Erreur migration courses {f_json.name}: {e}")
 
         # 4. Migration bilan_journee_*.json
-        for f_json in list(DOSSIER.glob("bilan_journee_*.json")):
+        for f_json in DOSSIER.glob("bilan_journee_*.json"):
             try:
                 date_iso = f_json.stem.replace("bilan_journee_", "")
                 with open(f_json, "r", encoding="utf-8") as f:
@@ -149,7 +145,6 @@ def migrer_anciens_json_vers_sqlite():
                             VALUES (?, ?, ?)
                         """, (date_iso, reunion_hyp, json.dumps(item, ensure_ascii=False)))
                 conn.commit()
-                f_json.replace(f_json.with_name(f_json.name + ".bak"))
             except Exception as e:
                 logger.error(f"Erreur migration bilan {f_json.name}: {e}")
 
@@ -158,50 +153,23 @@ def charger_historique():
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM paris")
-        # Les dictionnaires générés incluront désormais l'identifiant unique "id"
         rows = [dict(row) for row in cursor.fetchall()]
     return rows
 
 def sauvegarder_historique(historique):
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        
-        # 1. Identifier les IDs actuellement présents dans la liste envoyée
-        ids_fournis = [p["id"] for p in historique if "id" in p]
-        
-        # 2. Supprimer de la base de données UNIQUEMENT les paris qui ont été retirés de la liste
-        if ids_fournis:
-            placeholders = ",".join("?" * len(ids_fournis))
-            cursor.execute(f"DELETE FROM paris WHERE id NOT IN ({placeholders})", ids_fournis)
-        else:
-            # Si la liste est vide, on vide la table
-            cursor.execute("DELETE FROM paris")
-            
-        # 3. Mettre à jour les paris existants ou insérer les nouveaux
+        cursor.execute("DELETE FROM paris")
         for p in historique:
-            if "id" in p:
-                cursor.execute("""
-                    UPDATE paris SET 
-                        date=?, reunion=?, course_num=?, course=?, discipline=?, 
-                        type=?, details=?, mise=?, statut=?, gain=?, diagnostic=?
-                    WHERE id=?
-                """, (
-                    p.get("date"), p.get("reunion"), p.get("course_num"), p.get("course"),
-                    p.get("discipline"), p.get("type"), p.get("details"),
-                    p.get("mise", 0.0), p.get("statut", "En attente"),
-                    p.get("gain", 0.0), p.get("diagnostic", ""),
-                    p["id"]  # Clé unique pour la mise à jour
-                ))
-            else:
-                cursor.execute("""
-                    INSERT INTO paris (date, reunion, course_num, course, discipline, type, details, mise, statut, gain, diagnostic)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    p.get("date"), p.get("reunion"), p.get("course_num"), p.get("course"),
-                    p.get("discipline"), p.get("type"), p.get("details"),
-                    p.get("mise", 0.0), p.get("statut", "En attente"),
-                    p.get("gain", 0.0), p.get("diagnostic", "")
-                ))
+            cursor.execute("""
+                INSERT INTO paris (date, reunion, course_num, course, discipline, type, details, mise, statut, gain, diagnostic)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                p.get("date"), p.get("reunion"), p.get("course_num"), p.get("course"),
+                p.get("discipline"), p.get("type"), p.get("details"),
+                p.get("mise", 0.0), p.get("statut", "En attente"),
+                p.get("gain", 0.0), p.get("diagnostic", "")
+            ))
         conn.commit()
 
 def charger_courses_jour_db(date_iso):
