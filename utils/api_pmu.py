@@ -2,6 +2,8 @@
 import datetime
 import logging
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import streamlit as st
 from utils.database import DB_PATH, sauvegarder_courses_jour_db
 
@@ -73,7 +75,7 @@ def detecter_etat_terrain(conditions_texte):
             else "Souple"
         )
     return "Bon (Standard)"
-@st.cache_data
+
 def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
     try:
         dt = datetime.datetime.strptime(date_iso, "%Y-%m-%d")
@@ -86,14 +88,25 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
         f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}"
     )
     
-    # Utilisation d'une Session pour optimiser les performances réseau
+    # Utilisation d'une Session pour optimiser les performances réseau et ajouter une résilience
     session = requests.Session()
     session.headers.update(HEADERS)
+    
+    # Configuration d'une stratégie de reconnexion automatique (Retry)
+    retry_strategy = Retry(
+        total=3,  # 3 tentatives maximum
+        backoff_factor=1,  # Temps d'attente croissant (1s, 2s, 4s) entre chaque tentative
+        status_forcelist=[429, 500, 502, 503, 504],  # Codes HTTP déclenchant une relance
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
 
     try:
         res = session.get(url_programme, timeout=15)
         if res.status_code != 200:
-            logger.warning(f"Impossible de récupérer le programme PMU pour {date_iso} (Code HTTP: {res.status_code})[cite: 13]")
+            logger.warning(f"Impossible de récupérer le programme PMU pour {date_iso} (Code HTTP: {res.status_code})")
             return False
         data = res.json()
     except Exception as e:
@@ -151,6 +164,7 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
 
             url_partants = f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{num_r}/{num_c}/participants"
             try:
+                # La stratégie de retry configurée plus haut s'applique aussi ici automatiquement
                 res_part = session.get(url_partants, timeout=10)
                 chevaux = []
                 if res_part.status_code == 200:
@@ -205,6 +219,11 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
         progress_bar.empty()
         
     sauvegarder_courses_jour_db(date_iso, resultats_journee)
+    
+    # AVERTISSEMENT : st.cache_data.clear() vide l'intégralité du cache Streamlit.
+    # Si d'autres éléments de l'app utilisent le cache, remplacez cette ligne par :
+    # nom_de_la_fonction_a_vider.clear()
     st.cache_data.clear()
+    
     logger.info(f"Téléchargement et mise en cache réussis pour la date {date_iso}.")
     return True

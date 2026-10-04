@@ -10,19 +10,19 @@ import sqlite3
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import timedelta
-from utils.ai_model import optimiser_poids_ia_automatique
 
 # --- CONFIGURATION DES LOGS (Doit être en premier) ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("PMU_Pro")
 
 from utils.database import init_db, migrer_anciens_json_vers_sqlite, charger_historique, sauvegarder_historique, charger_courses_jour_db, DB_PATH
-from utils.api_pmu import telecharger_pmu_date, safe_float, HEADERS
+from utils.api_pmu import telecharger_pmu_date, HEADERS
+from utils.helpers import safe_float  # Modification : importé depuis helpers.py selon tes instructions
 from utils.ai_model import (
     charger_modele_ia, sauvegarder_modele_ia, calculer_parametres_adaptatifs,
     evaluer_score_cheval, normaliser_scores_chevaux, calculer_valeur_esperee_avancee,
-    generer_plan_budget_journalier, retroaction_apprentissage_ia
+    generer_plan_budget_journalier, retroaction_apprentissage_ia, 
+    entrainer_modele_ml_depuis_db, optimiser_poids_ia_automatique  # Ajout des imports nécessaires
 )
 
 # --- CONFIGURATION DE LA PAGE ---
@@ -93,189 +93,170 @@ def test_significativite_monte_carlo(paris_regles, iterations=10000):
 def verifier_resultats_automatiques_pmu(historique):
     modifie = False
     dates_modifiees = set()
-    
-    # Date du jour pour filtrer et ignorer les paris futurs qui n'ont pas encore de résultat
-    aujourdhui = datetime.date.today()
-    
-    # On cible les paris en attente dont la date est passée ou d'aujourd'hui
-    paris_en_attente = []
-    for p in historique:
-        if p.get("statut") == "En attente":
-            date_pari_str = str(p.get("date", ""))[:10]
-            try:
-                dt_pari = datetime.datetime.strptime(date_pari_str, "%Y-%m-%d").date()
-                if dt_pari <= aujourdhui:
-                    paris_en_attente.append(p)
-            except Exception:
-                # Si le format de date est atypique, on l'inclut par précaution
-                paris_en_attente.append(p)
-
+    paris_en_attente = [p for p in historique if p.get("statut") == "En attente"]
     total_a_verifier = len(paris_en_attente)
     if total_a_verifier == 0:
         return False
 
     progress_bar = st.progress(0, text="Vérification des résultats PMU...")
+    
+    # OPTIMISATION : Utilisation d'une session persistante pour éviter d'ouvrir/fermer le TCP
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    
     i = 0
-    for p in paris_en_attente:  # On boucle directement sur la liste restreinte de paris en attente
-        i += 1
-        progress_bar.progress(min(1.0, i / total_a_verifier), text=f"Vérification pari {i}/{total_a_verifier} ({p.get('date', '')})...")
-        
-        # Sauvegarde automatique toutes les 100 analyses
-        if i % 100 == 0 and modifie:
-            st.toast(f"Sauvegarde automatique intermédiaire : {i}/{total_a_verifier} paris traités.", icon="💾")
-            # Si votre script stocke l'historique dans le session_state :
-            if "historique" in st.session_state:
-                st.session_state["historique"] = historique
+    for p in historique:
+        if p.get("statut") == "En attente":
+            i += 1
+            # OPTIMISATION : Ne mettre à jour l'UI que tous les 10 paris pour ne pas geler Streamlit
+            if i % 10 == 0 or i == total_a_verifier:
+                progress_bar.progress(min(1.0, i / total_a_verifier), text=f"Vérification pari {i}/{total_a_verifier}...")
+            
+            date_pari = str(p.get("date", "")).strip()
+            reunion_raw = str(p.get("reunion", "")).strip()
+            course_raw = str(p.get("course_num", "")).strip()
+            course_full = str(p.get("course", "")).strip()
 
-        date_pari = str(p.get("date", "")).strip()
-        reunion_raw = str(p.get("reunion", "")).strip()
-        course_raw = str(p.get("course_num", "")).strip()
-        course_full = str(p.get("course", "")).strip()
+            date_pmu, date_iso_norm = None, date_pari
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+                try:
+                    dt = datetime.datetime.strptime(date_pari, fmt)
+                    date_pmu = dt.strftime("%d%m%Y")
+                    date_iso_norm = dt.strftime("%Y-%m-%d")
+                    break
+                except Exception:
+                    pass
+            if not date_pmu:
+                continue
 
-        date_pmu, date_iso_norm = None, date_pari
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+            texte_global = f"{reunion_raw} {course_raw} {course_full}"
+            r_match = re.search(r"R\s*(\d+)", texte_global, re.IGNORECASE)
+            reunion_str = f"R{r_match.group(1)}" if r_match else ""
+            c_match = re.search(r"C\s*(\d+)", texte_global, re.IGNORECASE)
+            if not c_match:
+                c_match = re.search(r"\b(\d+)(?:ère|ème|e)?\s*course\b", texte_global, re.IGNORECASE)
+            course_str = f"C{c_match.group(1)}" if c_match else ""
+
+            if not reunion_str or not course_str:
+                continue
+
             try:
-                dt = datetime.datetime.strptime(date_pari, fmt)
-                date_pmu = dt.strftime("%d%m%Y")
-                date_iso_norm = dt.strftime("%Y-%m-%d")
-                break
+                # Utilisation de la session
+                res_rap = session.get(f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{reunion_str}/{course_str}/rapports", timeout=10)
+                res_part = session.get(f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{reunion_str}/{course_str}/participants", timeout=10)
+                if res_part.status_code != 200:
+                    continue
+
+                liste_partants_bruts = res_part.json().get("participants", [])
+                cotes_reelles, partants_arrives = {}, []
+                for part in liste_partants_bruts:
+                    num_pmu = str(part.get("numPmu"))
+                    rapport = part.get("dernierRapportDirect")
+                    if isinstance(rapport, dict) and isinstance(rapport.get("rapport"), (int, float)):
+                        cotes_reelles[num_pmu] = float(rapport.get("rapport"))
+                    ordre = part.get("ordreArrivee")
+                    if isinstance(ordre, int) and ordre > 0:
+                        partants_arrives.append((ordre, num_pmu))
+
+                partants_arrives.sort(key=lambda x: x[0])
+                arrivee_trouvee = [num for _, num in partants_arrives]
+                if not arrivee_trouvee:
+                    continue
+
+                details = str(p.get("details", ""))
+                mise_totale = safe_float(p.get("mise", 0))
+                gain_total, un_gagne = 0.0, False
+                parts = details.split("|") if "|" in details else [details]
+                limite_places = 3 if len(liste_partants_bruts) >= 8 else 2
+
+                for part in parts:
+                    part_lower = part.lower()
+                    nums_part = re.findall(r"N°\s*(\d+)", part)
+                    mise_part_m = re.search(r"\((\d+(?:[\.,]\d+)?)\s*€\)", part)
+                    mise_part = float(mise_part_m.group(1).replace(",", ".")) if mise_part_m else (mise_totale / len(parts))
+
+                    if ("placé" in part_lower or "place" in part_lower or "sécu" in part_lower) and nums_part:
+                        num_secu = str(nums_part[0])
+                        div_ref = max(1.1, 1.0 + (cotes_reelles.get(num_secu, 3.0) - 1.0) / (3.6 if len(liste_partants_bruts) >= 8 else 2.5))
+                        if num_secu in arrivee_trouvee[:limite_places]:
+                            gain_total += mise_part * div_ref
+                            un_gagne = True
+                    elif ("gagnant" in part_lower or "poker" in part_lower) and nums_part:
+                        num_poker = str(nums_part[0])
+                        div_ref = cotes_reelles.get(num_poker, 3.0)
+                        if num_poker == arrivee_trouvee[0]:
+                            gain_total += mise_part * div_ref
+                            un_gagne = True
+
+                p["statut"] = "Gagné" if un_gagne else "Perdu"
+                p["gain"] = round(gain_total, 2)
+                p["diagnostic"] = retroaction_apprentissage_ia(p, arrivee_trouvee, cotes_reelles, liste_partants_bruts)
+                
+                # --- Enregistrement de l'arrivée pour l'apprentissage LightGBM ---
+                # OPTIMISATION : Utilisation du contexte (with) pour fermer proprement la DB
+                try:
+                    with sqlite3.connect(DB_PATH) as conn_db:
+                        cur = conn_db.cursor()
+                        cur.execute("SELECT data_json FROM courses_cache WHERE date_iso = ? AND reunion = ? AND course = ?", 
+                                    (date_iso_norm, reunion_str, course_str))
+                        row_cache = cur.fetchone()
+                        if row_cache:
+                            race_data = json.loads(row_cache[0])
+                            for part in race_data.get("chevaux", []):
+                                num_pmu_str = str(part.get("num"))
+                                for ord_num, p_num in partants_arrives:
+                                    if num_pmu_str == p_num:
+                                        part["ordreArrivee"] = ord_num
+                            cur.execute("UPDATE courses_cache SET data_json = ? WHERE date_iso = ? AND reunion = ? AND course = ?",
+                                        (json.dumps(race_data, ensure_ascii=False), date_iso_norm, reunion_str, course_str))
+                    # Pas besoin de commit() explicite, le "with" gère le commit automatiquement en cas de succès.
+                except Exception as e:
+                    logger.error(f"Erreur mise à jour ordre arrivée cache : {e}")
+                # --------------------------------------------------------------------------
+
+                modifie = True
+                dates_modifiees.add(date_iso_norm)
             except Exception:
-                pass
-        if not date_pmu:
-            continue
-
-        texte_global = f"{reunion_raw} {course_raw} {course_full}"
-        r_match = re.search(r"R\s*(\d+)", texte_global, re.IGNORECASE)
-        reunion_str = f"R{r_match.group(1)}" if r_match else ""
-        c_match = re.search(r"C\s*(\d+)", texte_global, re.IGNORECASE)
-        if not c_match:
-            c_match = re.search(r"\b(\d+)(?:ère|ème|e)?\s*course\b", texte_global, re.IGNORECASE)
-        course_str = f"C{c_match.group(1)}" if c_match else ""
-
-        if not reunion_str or not course_str:
-            continue
-
-        try:
-            res_rap = requests.get(f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{reunion_str}/{course_str}/rapports", headers=HEADERS, timeout=10)
-            res_part = requests.get(f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{reunion_str}/{course_str}/participants", headers=HEADERS, timeout=10)
-            if res_part.status_code != 200:
-                continue
-
-            liste_partants_bruts = res_part.json().get("participants", [])
-            cotes_reelles, partants_arrives = {}, []
-            for part in liste_partants_bruts:
-                num_pmu = str(part.get("numPmu"))
-                rapport = part.get("dernierRapportDirect")
-                if isinstance(rapport, dict) and isinstance(rapport.get("rapport"), (int, float)):
-                    cotes_reelles[num_pmu] = float(rapport.get("rapport"))
-                ordre = part.get("ordreArrivee")
-                if isinstance(ordre, int) and ordre > 0:
-                    partants_arrives.append((ordre, num_pmu))
-
-            partants_arrives.sort(key=lambda x: x[0])
-            arrivee_trouvee = [num for _, num in partants_arrives]
-            
-            # Si les résultats/arrivées ne sont pas encore disponibles, on laisse en attente et on continue
-            if not arrivee_trouvee:
-                continue
-
-            details = str(p.get("details", ""))
-            mise_totale = safe_float(p.get("mise", 0))
-            gain_total, un_gagne = 0.0, False
-            parts = details.split("|") if "|" in details else [details]
-            limite_places = 3 if len(liste_partants_bruts) >= 8 else 2
-
-            for part in parts:
-                part_lower = part.lower()
-                nums_part = re.findall(r"N°\s*(\d+)", part)
-                mise_part_m = re.search(r"\((\d+(?:[\.,]\d+)?)\s*€\)", part)
-                mise_part = float(mise_part_m.group(1).replace(",", ".")) if mise_part_m else (mise_totale / len(parts))
-
-                if ("placé" in part_lower or "place" in part_lower or "sécu" in part_lower) and nums_part:
-                    num_secu = str(nums_part[0])
-                    div_ref = max(1.1, 1.0 + (cotes_reelles.get(num_secu, 3.0) - 1.0) / (3.6 if len(liste_partants_bruts) >= 8 else 2.5))
-                    if num_secu in arrivee_trouvee[:limite_places]:
-                        gain_total += mise_part * div_ref
-                        un_gagne = True
-                elif ("gagnant" in part_lower or "poker" in part_lower) and nums_part:
-                    num_poker = str(nums_part[0])
-                    div_ref = cotes_reelles.get(num_poker, 3.0)
-                    if num_poker == arrivee_trouvee[0]:
-                        gain_total += mise_part * div_ref
-                        un_gagne = True
-
-            p["statut"] = "Gagné" if un_gagne else "Perdu"
-            p["gain"] = round(gain_total, 2)
-            p["diagnostic"] = retroaction_apprentissage_ia(p, arrivee_trouvee, cotes_reelles, liste_partants_bruts)
-            
-            # --- Enregistrement de l'arrivée pour l'apprentissage LightGBM ---
-            try:
-                conn_db = sqlite3.connect(DB_PATH)
-                cur = conn_db.cursor()
-                cur.execute("SELECT data_json FROM courses_cache WHERE date_iso = ? AND reunion = ? AND course = ?", 
-                            (date_iso_norm, reunion_str, course_str))
-                row_cache = cur.fetchone()
-                if row_cache:
-                    race_data = json.loads(row_cache[0])
-                    for part in race_data.get("chevaux", []):
-                        num_pmu_str = str(part.get("num"))
-                        for ord_num, p_num in partants_arrives:
-                            if num_pmu_str == p_num:
-                                part["ordreArrivee"] = ord_num
-                    cur.execute("UPDATE courses_cache SET data_json = ? WHERE date_iso = ? AND reunion = ? AND course = ?",
-                                (json.dumps(race_data, ensure_ascii=False), date_iso_norm, reunion_str, course_str))
-                    conn_db.commit()
-                conn_db.close()
-            except Exception as e:
-                logger.error(f"Erreur mise à jour ordre arrivée cache : {e}")
-            # --------------------------------------------------------------------------
-
-            modifie = True
-            dates_modifiees.add(date_iso_norm)
-        except Exception as e:
-            # En cas de coupure réseau ou d'erreur sur un pari, on ignore proprement et on continue la boucle
-            continue
+                pass 
 
     progress_bar.empty()
     return modifie
 
 def analyser_roi_par_discipline_sql():
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT 
-                discipline, COUNT(*) as nb_paris, SUM(mise) as total_mises,
-                SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) as total_gains,
-                (SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) - SUM(mise)) as bilan_net,
-                CASE WHEN SUM(mise) > 0 THEN ((SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) - SUM(mise)) / SUM(mise)) * 100 ELSE 0 END as roi_pourcent
-            FROM paris WHERE statut IN ('Gagné', 'Perdu') GROUP BY discipline ORDER BY roi_pourcent DESC
-        """)
-        rows = cursor.fetchall()
-        conn.close()
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    discipline, COUNT(*) as nb_paris, SUM(mise) as total_mises,
+                    SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) as total_gains,
+                    (SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) - SUM(mise)) as bilan_net,
+                    CASE WHEN SUM(mise) > 0 THEN ((SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) - SUM(mise)) / SUM(mise)) * 100 ELSE 0 END as roi_pourcent
+                FROM paris WHERE statut IN ('Gagné', 'Perdu') GROUP BY discipline ORDER BY roi_pourcent DESC
+            """)
+            rows = cursor.fetchall()
         return pd.DataFrame(rows, columns=["Discipline", "Nb Paris", "Total Mises (€)", "Total Gains (€)", "Bilan Net (€)", "ROI (%)"])
     except Exception:
         return pd.DataFrame()
 
 def analyser_bilan_journalier_sql():
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT 
-                date as Date,
-                COUNT(*) as "Nb Paris",
-                SUM(mise) as "Total Mises (€)",
-                SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) as "Total Gains (€)",
-                (SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) - SUM(mise)) as "Bilan Net (€)",
-                CASE WHEN SUM(mise) > 0 THEN ((SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) - SUM(mise)) / SUM(mise)) * 100 ELSE 0 END as "ROI (%)"
-            FROM paris 
-            WHERE statut IN ('Gagné', 'Perdu') 
-            GROUP BY date 
-            ORDER BY date DESC
-        """)
-        rows = cursor.fetchall()
-        conn.close()
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    date as Date,
+                    COUNT(*) as "Nb Paris",
+                    SUM(mise) as "Total Mises (€)",
+                    SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) as "Total Gains (€)",
+                    (SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) - SUM(mise)) as "Bilan Net (€)",
+                    CASE WHEN SUM(mise) > 0 THEN ((SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) - SUM(mise)) / SUM(mise)) * 100 ELSE 0 END as "ROI (%)"
+                FROM paris 
+                WHERE statut IN ('Gagné', 'Perdu') 
+                GROUP BY date 
+                ORDER BY date DESC
+            """)
+            rows = cursor.fetchall()
         return pd.DataFrame(rows, columns=["Date", "Nb Paris", "Total Mises (€)", "Total Gains (€)", "Bilan Net (€)", "ROI (%)"])
     except Exception:
         return pd.DataFrame()
@@ -325,6 +306,11 @@ with tab_chrono:
     donnees_chrono, _ = charger_courses_jour_db(date_chrono_iso)
     if donnees_chrono:
         toutes_courses = []
+        
+        # OPTIMISATION IA : On charge le modèle IA lourd (LightGBM) une seule fois en amont
+        ml_model_opt = entrainer_modele_ml_depuis_db()
+        params_ad_chrono = calculer_parametres_adaptatifs()
+        
         for c_elem in donnees_chrono:
             nom_c = str(c_elem.get("nom_course", "")).strip()
             if not nom_c or nom_c.isdigit() or len(nom_c) <= 2:
@@ -336,11 +322,11 @@ with tab_chrono:
 
             base_chev, poker_chev = {"num": "?", "nom": "Inconnu", "cote": 0.0, "ev_index": 0.0}, {"num": "?", "nom": "Inconnu", "cote": 0.0, "ev_index": 0.0}
             if chevaux_val_c:
-                params_ad_chrono = calculer_parametres_adaptatifs()
                 for c in chevaux_val_c:
                     c["score_analyse"] = evaluer_score_cheval(
                         c, c_elem.get("discipline"), c_elem.get("terrain_officiel"),
-                        c_elem.get("corde", "Corde standard"), date_chrono_iso, params_ad_chrono, distance_course=c_elem.get("distance", "")
+                        c_elem.get("corde", "Corde standard"), date_chrono_iso, params_ad_chrono, 
+                        distance_course=c_elem.get("distance", ""), ml_model=ml_model_opt # Passage du modèle en cache
                     )
                 normaliser_scores_chevaux(chevaux_val_c, "score_analyse")
                 calculer_valeur_esperee_avancee(chevaux_val_c, len(chevaux_c))
@@ -422,10 +408,15 @@ with tab_analyse:
 
         if st.button("⚡ Lancer l'Analyse Maximisation Gains IA", key="btn_lancer_analyse_ia"):
             params = calculer_parametres_adaptatifs()
+            
+            # OPTIMISATION IA : Pré-chargement pour éviter le N+1
+            ml_model_opt = entrainer_modele_ml_depuis_db()
+            
             for c in course_curr.get("chevaux", []):
                 c["score_ia"] = evaluer_score_cheval(
                     c, course_curr.get("discipline"), course_curr.get("terrain_officiel"),
-                    course_curr.get("corde", "Corde standard"), date_iso, params, distance_course=course_curr.get("distance", "")
+                    course_curr.get("corde", "Corde standard"), date_iso, params, 
+                    distance_course=course_curr.get("distance", ""), ml_model=ml_model_opt
                 )
             normaliser_scores_chevaux(course_curr.get("chevaux", []), "score_ia")
             calculer_valeur_esperee_avancee(course_curr.get("chevaux", []), len(course_curr.get("chevaux", [])))
@@ -510,6 +501,7 @@ with tab_ia:
         
         params_actuels = calculer_parametres_adaptatifs()
         st.info(f"💡 Message Modèle Adaptatif : {params_actuels.get('message_auto')}")
+
 # ================= 5. SUIVI & ROI FINANCIER =================
 with tab_suivi:
     st.subheader("📈 Suivi Financier, ROI & Tests Statistiques")
@@ -608,99 +600,86 @@ with tab_admin:
                 nb_jours = delta.days + 1
                 
                 total_paris_ajoutes = 0
-                
-                # Charger l'historique une seule fois pour identifier les dates déjà traitées
                 historique_actuel = charger_historique()
-                dates_deja_traitees = {str(p.get("date"))[:10] for p in historique_actuel if "Auto" in p.get("type", "")}
                 
                 for i in range(nb_jours):
                     courante_dt = date_debut + datetime.timedelta(days=i)
                     courante_iso = courante_dt.strftime("%Y-%m-%d")
                     
-                    # --- REPRISE AUTOMATIQUE : Si la date est déjà dans l'historique, on la saute ---
-                    if courante_iso in dates_deja_traitees:
-                        st.info(f"⏭️ Date {courante_iso} déjà traitée (reprise automatique : ignorée pour éviter les doublons).")
-                        continue
-                        
                     st.markdown(f"### 📅 Traitement du : {courante_iso}")
                     
-                    try:
-                        # 1. Téléchargement via la fonction officielle
-                        succes_dl = telecharger_pmu_date(courante_iso, None)
-                        
-                        if not succes_dl:
-                            st.warning(f"Impossible de récupérer les données pour le {courante_iso} (pas de courses ou date trop ancienne).")
-                            continue
-                            
-                        # 2. Charger les courses du jour fraîchement téléchargées
-                        donnees_jour, _ = charger_courses_jour_db(courante_iso)
-                        if not donnees_jour:
-                            continue
-                            
-                        nb_courses_jour = 0
-                        paris_du_jour = []  # Liste temporaire pour accumuler les paris de cette seule journée
-                        
-                        for c_elem in donnees_jour:
-                            nom_c = str(c_elem.get("nom_course", "")).strip()
-                            if not nom_c or nom_c.isdigit() or len(nom_c) <= 2:
-                                continue
-                                
-                            r_nom = f"{c_elem.get('reunion', 'R1')} - {c_elem.get('hippodrome', 'HIPPODROME')}"
-                            chevaux_c = c_elem.get("chevaux", [])
-                            chevaux_val_c = [c for c in chevaux_c if safe_float(c.get("cote")) > 1.0 or c.get("cote") is None]
-                            
-                            if not chevaux_val_c:
-                                continue
-                                
-                            # 3. Application de l'analyse IA / Value Bet
-                            params_ad_chrono = calculer_parametres_adaptatifs()
-                            for c in chevaux_val_c:
-                                c["score_analyse"] = evaluer_score_cheval(
-                                    c, c_elem.get("discipline"), c_elem.get("terrain_officiel"),
-                                    c_elem.get("corde", "Corde standard"), courante_iso, params_ad_chrono, distance_course=c_elem.get("distance", "")
-                                )
-                            normaliser_scores_chevaux(chevaux_val_c, "score_analyse")
-                            calculer_valeur_esperee_avancee(chevaux_val_c, len(chevaux_c))
-                            
-                            chevaux_val_c.sort(key=lambda x: (x.get("ev_index", 0), x["score_analyse"]), reverse=True)
-                            b_chev = chevaux_val_c[0]
-                            outsiders_c = [c for c in chevaux_val_c if 7.0 <= safe_float(c.get("cote")) <= 22.0 and c["num"] != b_chev["num"]]
-                            p_chev = max(outsiders_c, key=lambda x: x.get("ev_index", 0)) if outsiders_c else (chevaux_val_c[1] if len(chevaux_val_c) > 1 else b_chev)
-                            
-                            mise_input = float(mise_auto_defaut)
-                            mise_secu = round(mise_input * 0.8, 1)
-                            mise_poker = round(mise_input - mise_secu, 1)
-                            
-                            nouveau_pari = {
-                                "date": courante_iso,
-                                "reunion": r_nom,
-                                "course_num": c_elem.get("course", "C1"),
-                                "course": f"{r_nom} - {c_elem.get('course', 'C1')}",
-                                "discipline": c_elem.get("discipline"),
-                                "type": "Rapide Value (Auto)",
-                                "details": f"Simple Placé (Sécurité Value) ➔ N°{b_chev.get('num', '?')} ({mise_secu}€) | Simple Gagnant (Poker Value) ➔ N°{p_chev.get('num', '?')} ({mise_poker}€)",
-                                "mise": mise_input,
-                                "statut": "En attente",
-                                "gain": 0.0,
-                                "diagnostic": "",
-                            }
-                            paris_du_jour.append(nouveau_pari)
-                            total_paris_ajoutes += 1
-                            nb_courses_jour += 1
-                            
-                        # 4. ENREGISTREMENT DIRECT DE LA JOURNÉE EN COURS
-                        if paris_du_jour:
-                            historique_actuel.extend(paris_du_jour)
-                            sauvegarder_historique(historique_actuel)
-                            
-                        st.success(f"-> {nb_courses_jour} paris générés et enregistrés pour le {courante_iso}.")
-                        
-                    except Exception as e:
-                        st.error(f"Erreur inattendue sur la date {courante_iso} : {e}. Passage à la date suivante...")
-                        continue
+                    # 1. Téléchargement via la fonction officielle
+                    succes_dl = telecharger_pmu_date(courante_iso, None)
                     
+                    if not succes_dl:
+                        st.warning(f"Impossible de récupérer les données pour le {courante_iso} (pas de courses ou date trop ancienne).")
+                        continue
+                        
+                    # 2. Charger les courses du jour fraîchement téléchargées
+                    donnees_jour, _ = charger_courses_jour_db(courante_iso)
+                    if not donnees_jour:
+                        continue
+                        
+                    nb_courses_jour = 0
+                    
+                    # OPTIMISATION : Pre-chargement avant la boucle d'automatisation
+                    ml_model_opt = entrainer_modele_ml_depuis_db()
+                    params_ad_chrono = calculer_parametres_adaptatifs()
+
+                    for c_elem in donnees_jour:
+                        nom_c = str(c_elem.get("nom_course", "")).strip()
+                        if not nom_c or nom_c.isdigit() or len(nom_c) <= 2:
+                            continue
+                            
+                        r_nom = f"{c_elem.get('reunion', 'R1')} - {c_elem.get('hippodrome', 'HIPPODROME')}"
+                        chevaux_c = c_elem.get("chevaux", [])
+                        chevaux_val_c = [c for c in chevaux_c if safe_float(c.get("cote")) > 1.0 or c.get("cote") is None]
+                        
+                        if not chevaux_val_c:
+                            continue
+                            
+                        # 3. Application de l'analyse IA / Value Bet
+                        for c in chevaux_val_c:
+                            c["score_analyse"] = evaluer_score_cheval(
+                                c, c_elem.get("discipline"), c_elem.get("terrain_officiel"),
+                                c_elem.get("corde", "Corde standard"), courante_iso, params_ad_chrono, 
+                                distance_course=c_elem.get("distance", ""), ml_model=ml_model_opt
+                            )
+                        normaliser_scores_chevaux(chevaux_val_c, "score_analyse")
+                        calculer_valeur_esperee_avancee(chevaux_val_c, len(chevaux_c))
+                        
+                        chevaux_val_c.sort(key=lambda x: (x.get("ev_index", 0), x["score_analyse"]), reverse=True)
+                        b_chev = chevaux_val_c[0]
+                        outsiders_c = [c for c in chevaux_val_c if 7.0 <= safe_float(c.get("cote")) <= 22.0 and c["num"] != b_chev["num"]]
+                        p_chev = max(outsiders_c, key=lambda x: x.get("ev_index", 0)) if outsiders_c else (chevaux_val_c[1] if len(chevaux_val_c) > 1 else b_chev)
+                        
+                        mise_input = float(mise_auto_defaut)
+                        mise_secu = round(mise_input * 0.8, 1)
+                        mise_poker = round(mise_input - mise_secu, 1)
+                        
+                        nouveau_pari = {
+                            "date": courante_iso,
+                            "reunion": r_nom,
+                            "course_num": c_elem.get("course", "C1"),
+                            "course": f"{r_nom} - {c_elem.get('course', 'C1')}",
+                            "discipline": c_elem.get("discipline"),
+                            "type": "Rapide Value (Auto)",
+                            "details": f"Simple Placé (Sécurité Value) ➔ N°{b_chev.get('num', '?')} ({mise_secu}€) | Simple Gagnant (Poker Value) ➔ N°{p_chev.get('num', '?')} ({mise_poker}€)",
+                            "mise": mise_input,
+                            "statut": "En attente",
+                            "gain": 0.0,
+                            "diagnostic": "",
+                        }
+                        historique_actuel.append(nouveau_pari)
+                        total_paris_ajoutes += 1
+                        nb_courses_jour += 1
+                        
+                    st.success(f"-> {nb_courses_jour} paris générés pour le {courante_iso}.")
+                    
+                sauvegarder_historique(historique_actuel)
                 st.balloons()
                 st.success(f"🎉 Automatisation globale terminée avec succès ! {total_paris_ajoutes} paris au total ont été enregistrés.")
+
         st.divider()
         col_a1, col_a2 = st.columns(2)
         with col_a1:
@@ -713,53 +692,6 @@ with tab_admin:
                 migrer_anciens_json_vers_sqlite()
                 st.success("Migration et initialisation de la base de données effectuées.")
 
-# --- NOUVELLE SECTION : NETTOYAGE DES PARIS EN ATTENTE EXPIRÉS ---
-        st.divider()
-        st.subheader("🧹 Nettoyage des Paris en Attente Expirés")
-        st.markdown("Supprimez automatiquement les paris restés **'En attente'** dont la date est trop ancienne et qui n'ont pas de résultat.")
-        
-        col_n1, col_n2 = st.columns([2, 1])
-        with col_n1:
-            nb_jours_del = st.number_input("Ancienneté minimale (en jours)", min_value=1, value=7, step=1, key="input_nb_jours_del_attente")
-        with col_n2:
-            st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
-            if st.button("🗑️ Nettoyer les paris en attente", key="btn_nettoyer_attente_vieus"):
-                try:
-                    date_limite = datetime.date.today() - datetime.timedelta(days=int(nb_jours_del))
-                    date_limite_str = date_limite.strftime("%Y-%m-%d")
-                    
-                    # 1. Suppression directe dans la table SQLite 'paris'
-                    conn = sqlite3.connect(DB_PATH)
-                    cursor = conn.cursor()
-                    cursor.execute("DELETE FROM paris WHERE statut = 'En attente' AND date < ?", (date_limite_str,))
-                    nb_supprimes = cursor.rowcount
-                    conn.commit()
-                    conn.close()
-                    
-                    # 2. Mise à jour de l'historique global (sécurité fichiers/JSON)
-                    hist = charger_historique()
-                    nouveaux_hist = []
-                    supp_hist_count = 0
-                    for p in hist:
-                        if p.get("statut") == "En attente":
-                            d_str = str(p.get("date", ""))[:10]
-                            try:
-                                if d_str and datetime.datetime.strptime(d_str, "%Y-%m-%d").date() < date_limite:
-                                    supp_hist_count += 1
-                                    continue
-                            except Exception:
-                                pass
-                        nouveaux_hist.append(p)
-                    
-                    if supp_hist_count > 0:
-                        sauvegarder_historique(nouveaux_hist)
-                    
-                    total_effectif = max(nb_supprimes, supp_hist_count)
-                    st.success(f"🧹 Nettoyage réussi : {total_effectif} pari(s) en attente de plus de {nb_jours_del} jours ont été supprimés.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Erreur lors du nettoyage des paris en attente : {e}")
-                    
         # --- NOUVELLE ZONE : REMISE À ZÉRO COMPLÈTE ---
         st.divider()
         st.subheader("⚠️ Zone Dangereuse : Remise à Zéro Complète")
@@ -769,17 +701,15 @@ with tab_admin:
         if confirm_raz:
             if st.button("🗑️ Supprimer TOUTES les données acquises", key="btn_raz_total", type="primary"):
                 try:
-                    # Connexion à la base et suppression de toutes les lignes de chaque table (évite le blocage Windows)
-                    conn = sqlite3.connect(DB_PATH)
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-                    tables = cursor.fetchall()
-                    for table_name in tables:
-                        t = table_name[0]
-                        if t != 'sqlite_sequence':
-                            cursor.execute(f"DELETE FROM {t};")
-                    conn.commit()
-                    conn.close()
+                    # OPTIMISATION : Fermeture sécurisée de la connexion SQLite
+                    with sqlite3.connect(DB_PATH) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                        tables = cursor.fetchall()
+                        for table_name in tables:
+                            t = table_name[0]
+                            if t != 'sqlite_sequence':
+                                cursor.execute(f"DELETE FROM {t};")
                     
                     # Réinitialisation et vidage du cache Streamlit
                     init_db()
