@@ -148,7 +148,15 @@ def entrainer_modele_ml_depuis_db():
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT date_iso, data_json FROM courses_cache ORDER BY date_iso ASC")
+        
+        # Modification : Filtrage glissant sur les 12 derniers mois
+        cursor.execute("""
+            SELECT date_iso, data_json 
+            FROM courses_cache 
+            WHERE date_iso >= date('now', '-12 months') 
+            ORDER BY date_iso ASC
+        """)
+        
         rows = cursor.fetchall()
         conn.close()
 
