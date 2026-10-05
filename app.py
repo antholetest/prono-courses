@@ -431,11 +431,53 @@ with tab_analyse:
             calculer_valeur_esperee_avancee(course_curr.get("chevaux", []), len(course_curr.get("chevaux", [])))
 
             chevaux_tries = sorted(course_curr.get("chevaux", []), key=lambda x: x.get("ev_index", 0), reverse=True)
+            
+            # Stockage des chevaux analysés dans la session pour pouvoir les parier
+            st.session_state["chevaux_analyse_courant"] = chevaux_tries
+
             st.dataframe([{
                 "N°": c["num"], "Nom": c["nom"], "Driver": c.get("driver"), "Cote": c.get("cote"),
                 "Score IA": c.get("score_ia"), "Proba (Softmax)": f"{safe_float(c.get('proba_estimee',0))*100:.1f}%",
                 "EV Gagnant": c.get("ev_index"), "EV Placé": c.get("ev_place_index")
             } for c in chevaux_tries], width="stretch")
+
+        # --- BOUTON DE VALIDATION & ENREGISTREMENT DU PARI ---
+        if "chevaux_analyse_courant" in st.session_state and st.session_state["chevaux_analyse_courant"]:
+            st.divider()
+            st.markdown("### 📝 Enregistrer un pari sur cette course analysée")
+            chevaux_analyse = st.session_state["chevaux_analyse_courant"]
+            
+            col_v1, col_v2, col_v3 = st.columns([2, 1, 1])
+            with col_v1:
+                options_chevaux = [f"N°{c['num']} - {c['nom']} (Cote: {safe_float(c.get('cote')):.1f})" for c in chevaux_analyse]
+                cheval_selectionne_str = st.selectbox("Sélectionner le cheval", options_chevaux, key="sel_cheval_analyse")
+            with col_v2:
+                type_pari_sel = st.selectbox("Type de pari", ["Simple Gagnant", "Simple Placé", "Value Bet IA"], key="sel_type_pari_analyse")
+            with col_v3:
+                mise_analyse = st.number_input("Mise (€)", min_value=1.0, value=10.0, step=1.0, key="mise_analyse_input")
+                
+            if st.button("⚡ Valider & Enregistrer ce Pari", key="btn_valider_analyse_cours"):
+                match_num = re.search(r"N°(\d+)", cheval_selectionne_str)
+                num_cheval = match_num.group(1) if match_num else "?"
+                
+                nouveau_pari = {
+                    "date": date_iso,
+                    "reunion": reunion_choisie,
+                    "course_num": course_curr.get("course"),
+                    "course": f"{reunion_choisie} - {course_curr.get('course')}",
+                    "discipline": course_curr.get("discipline"),
+                    "type": f"Analyse IA ({type_pari_sel})",
+                    "details": f"{type_pari_sel} ➔ N°{num_cheval} ({mise_analyse}€)",
+                    "mise": float(mise_analyse),
+                    "statut": "En attente",
+                    "gain": 0.0,
+                    "diagnostic": "",
+                }
+                hist = charger_historique()
+                hist.append(nouveau_pari)
+                sauvegarder_historique(hist)
+                st.success("Pari validé et enregistré avec succès depuis l'onglet Analyse !")
+                st.rerun()
 
         st.divider()
         st.subheader("💰 Allocation Stratégique (Critère de Kelly)")
@@ -452,7 +494,52 @@ with tab_analyse:
 
         if st.session_state.get("plan_courant"):
             st.write("### 📌 Stratégie de Mises Optimisée")
-            st.dataframe(st.session_state["plan_courant"], width="stretch")
+            plan_data = st.session_state["plan_courant"]
+            if isinstance(plan_data, pd.DataFrame):
+                st.dataframe(plan_data, width="stretch")
+                plan_df = plan_data
+            else:
+                plan_df = pd.DataFrame(plan_data)
+                st.dataframe(plan_df, width="stretch")
+
+            # --- BOUTON DE VALIDATION DU PLAN D'ALLOCATION ---
+            if st.button("⚡ Valider & Enregistrer le Plan d'Allocation Optimal", key="btn_valider_plan_allocation"):
+                hist = charger_historique()
+                nouveaux_paris = []
+                
+                for _, row in plan_df.iterrows():
+                    reunion = str(row.get("Réunion", row.get("reunion", "R1")))
+                    course_num = str(row.get("Course", row.get("course_num", row.get("course", "C1"))))
+                    cheval_nom = str(row.get("Cheval", row.get("cheval", row.get("nom", ""))))
+                    num_cheval = str(row.get("N°", row.get("num", "")))
+                    mise = safe_float(row.get("Mise (€)", row.get("mise", 10.0)))
+                    type_pari = str(row.get("Type", row.get("type_pari", "Allocation Kelly")))
+                    
+                    details = f"{type_pari} ➔ N°{num_cheval} {cheval_nom} ({mise}€)"
+                    
+                    nouveau_pari = {
+                        "date": date_iso,
+                        "reunion": reunion,
+                        "course_num": course_num,
+                        "course": f"{reunion} - {course_num}",
+                        "discipline": course_curr.get("discipline", ""),
+                        "type": "Allocation Kelly (Optimal)",
+                        "details": details,
+                        "mise": mise,
+                        "statut": "En attente",
+                        "gain": 0.0,
+                        "diagnostic": "",
+                    }
+                    nouveaux_paris.append(nouveau_pari)
+                
+                if nouveaux_paris:
+                    hist.extend(nouveaux_paris)
+                    sauvegarder_historique(hist)
+                    st.success(f"✅ {len(nouveaux_paris)} paris du plan d'allocation optimal ont été validés et enregistrés avec succès !")
+                    st.session_state.pop("plan_courant", None)
+                    st.rerun()
+                else:
+                    st.warning("Aucun pari trouvé dans le plan d'allocation.")
     else:
         st.info("Aucune réunion disponible pour cette date.")
 
