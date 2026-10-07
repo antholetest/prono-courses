@@ -34,7 +34,7 @@ MODELE_IA_DEFAUT = {
     "poids_hippodrome_acteur": 1.25,
     "poids_distance": 1.1,
     "poids_outsider_cache": 1.30,
-    "seuil_value_bet": 1.50,
+    "seuil_value_bet": 1.85,  # Seuil durci pour filtrer les faux value bets
     "frequence_kelly": 0.05,
     "stats_impact": {
         "victoires_par_ferrage": 0,
@@ -127,6 +127,14 @@ def extraire_caracteristiques_cheval(cheval, discipline, terrain, hippodrome="")
     cote = safe_float(cheval.get("cote"), 10.0)
     poids = safe_float(cheval.get("poids"), 0.0)
     
+    # --- NOUVELLES FEATURES AVANCÉES ---
+    deferre_str = str(cheval.get("deferre", "")).upper()
+    is_deferre_4 = 1 if "QUATRE" in deferre_str else 0  # 1 si déferré des 4 pieds, sinon 0
+    
+    tendance = str(cheval.get("tendance_cote", "stable"))
+    tendance_val = 1.0 if tendance == "baisse_forte" else (-1.0 if tendance == "hausse" else 0.0)
+    # ------------------------------------
+    
     is_trot = 1 if "Trot" in str(discipline) else 0
     is_lourd = 1 if terrain in ["Collant", "Lourd"] else 0
     
@@ -138,18 +146,20 @@ def extraire_caracteristiques_cheval(cheval, discipline, terrain, hippodrome="")
         taux_driver_hipp,
         cote,
         poids,
+        is_deferre_4,    # Feature 8 : Déferré des 4 pieds
+        tendance_val,    # Feature 9 : Mouvement de cote
         is_trot,
         is_lourd
     ]
 
 @st.cache_resource
 def entrainer_modele_ml_depuis_db():
-    """Entraîne un modèle LightGBM Ranking avec Time-Series Split et évaluation continue."""
+    """Entraîne un modèle LightGBM Ranking ciblant strictement la victoire (Simple Gagnant)."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
-        # Modification : Filtrage glissant sur les 12 derniers mois
+        # Filtrage glissant sur les 12 derniers mois
         cursor.execute("""
             SELECT date_iso, data_json 
             FROM courses_cache 
@@ -181,10 +191,11 @@ def entrainer_modele_ml_depuis_db():
                     features = extraire_caracteristiques_cheval(part, discipline, terrain, hippodrome)
                     ordre = part.get("ordreArrivee", 0)
                     
-                    if ordre == 1: relevance = 4
-                    elif ordre in [2, 3]: relevance = 3
-                    elif ordre in [4, 5]: relevance = 1
-                    else: relevance = 0
+                    # --- CIBLAGE STRICT DE LA GAGNE (Seul le 1er obtient un poids fort) ---
+                    if ordre == 1: 
+                        relevance = 5
+                    else: 
+                        relevance = 0  
                         
                     race_feats.append(features)
                     race_labs.append(relevance)
@@ -722,14 +733,14 @@ def ajuster_seuil_value_bet_dynamique():
         
     roi_recent = ((gains - mises) / mises) * 100
     modele_ia = charger_modele_ia()
-    seuil_actuel = modele_ia.get("seuil_value_bet", 1.50)
+    seuil_actuel = modele_ia.get("seuil_value_bet", 1.85)
     
     nouveau_seuil = seuil_actuel
     
     if roi_recent < -15.0:
-        nouveau_seuil = min(2.00, seuil_actuel + 0.05)
+        nouveau_seuil = min(2.20, seuil_actuel + 0.05)
     elif roi_recent > 20.0:
-        nouveau_seuil = max(1.30, seuil_actuel - 0.05)
+        nouveau_seuil = max(1.50, seuil_actuel - 0.05)
         
     if nouveau_seuil != seuil_actuel:
         modele_ia["seuil_value_bet"] = round(nouveau_seuil, 2)
@@ -870,7 +881,7 @@ def calculer_valeur_esperee_avancee(chevaux_valides, nb_partants=12):
     if not chevaux_valides:
         return chevaux_valides
 
-    temperature = 12.0
+    temperature = 8.5  # Température abaissée pour trancher plus nettement les probabilités
     scores = [safe_float(c.get("score_analyse", 0)) for c in chevaux_valides]
     max_score = max(scores, default=0.0)
 
@@ -910,7 +921,7 @@ def generer_plan_budget_journalier(date_iso, budget_base, params_adaptatifs):
     opportunites = []
     malus_disc = params_adaptatifs.get("malus_discipline", {})
     modele_ia = charger_modele_ia()
-    seuil_min_ev = modele_ia.get("seuil_value_bet", 1.50)
+    seuil_min_ev = modele_ia.get("seuil_value_bet", 1.85)
     frequence_k = modele_ia.get("frequence_kelly", 0.05)
 
     for course in donnees:
@@ -956,6 +967,14 @@ def generer_plan_budget_journalier(date_iso, budget_base, params_adaptatifs):
         meilleur_ev = chevaux_tries_ev[0]
 
         if meilleur_ev["ev_index"] < seuil_min_ev:
+            continue
+
+        # --- FILTRE SUPPLÉMENTAIRE : TRANCHE DE COTE OPTIMALE ---
+        cote_cheval = safe_float(meilleur_ev.get("cote"), 0.0)
+        
+        # On évite les hyper-favoris (< 2.0) où la valeur est écrasée par le prélèvement PMU, 
+        # et les très gros outsiders (> 30.0) trop aléatoires pour la gagne pure.
+        if cote_cheval < 2.0 or cote_cheval > 30.0:
             continue
 
         ecart_score = (
@@ -1141,8 +1160,8 @@ def calculer_parametres_adaptatifs():
 
 def retroaction_apprentissage_ia(pari, arrivee_trouvee, cotes_reelles, liste_partants_bruts):
     """
-    Analyse le résultat d'un pari terminé, met à jour les stats d'impact du modèle 
-    et enregistre les gains/pertes cumulés.
+    Analyse le résultat d'un pari terminé, génère un diagnostic explicatif détaillé 
+    pour le cheval gagnant, met à jour les stats d'impact du modèle et enregistre les gains/pertes.
     """
     statut = pari.get("statut", "Inconnu")
     mise = safe_float(pari.get("mise", 0))
@@ -1152,14 +1171,41 @@ def retroaction_apprentissage_ia(pari, arrivee_trouvee, cotes_reelles, liste_par
     modele = charger_modele_ia()
     stats = modele.get("stats_impact", {})
     
-    # Incrémentation des statistiques d'impact
     stats["total_analyses"] = stats.get("total_analyses", 0) + 1
     stats["gain_cumule_ia"] = stats.get("gain_cumule_ia", 0.0) + profit
 
     details = str(pari.get("details", ""))
-    if statut == "Gagné":
-        if "déferré" in details.lower() or "quatuor" in details.lower() or "sécurité" in details.lower():
-            stats["victoires_par_ferrage"] = stats.get("victoires_par_ferrage", 0) + 1
+    
+    # --- GÉNÉRATEUR AUTOMATIQUE DE POST-ANALYSE DU VAINQUEUR ---
+    explication_gagnant = ""
+    if arrivee_trouvee:
+        num_gagnant = arrivee_trouvee[0]
+        cheval_gagnant = next((p for p in liste_partants_bruts if str(p.get("numPmu")) == str(num_gagnant)), None)
+        
+        if cheval_gagnant:
+            nom_g = cheval_gagnant.get("nom", "Inconnu")
+            musique_g = cheval_gagnant.get("musique", "")
+            deferre_g = cheval_gagnant.get("deferre", "")
+            driver_g = cheval_gagnant.get("driver", cheval_gagnant.get("jockey", ""))
+            cote_g = cotes_reelles.get(str(num_gagnant), safe_float(cheval_gagnant.get("dernierRapportDirect", {}).get("rapport"), 0.0))
+            
+            facteurs_cles = []
+            if "QUATRE" in str(deferre_g).upper():
+                facteurs_cles.append("Déferré des 4 pieds (Optimal)")
+            score_f, _, _, _ = analyser_forme_musique_avancee(musique_g)
+            if score_f > 15:
+                facteurs_cles.append(f"Forte forme récente (Musique : {musique_g})")
+            if cote_g > 0 and cote_g < 5.0:
+                facteurs_cles.append(f"Statut de favori logique (Cote: {cote_g:.1f})")
+            elif cote_g >= 5.0:
+                facteurs_cles.append(f"Cote de value/outsider validée (Cote: {cote_g:.1f})")
+            if driver_g:
+                facteurs_cles.append(f"Piloté par {driver_g}")
+                
+            explication_gagnant = f" ➔ Vainqueur N°{num_gagnant} ({nom_g}) analysé : " + (" | ".join(facteurs_cles) if facteurs_cles else "Victoire de régularité")
+            
+            if statut == "Gagné" and ("déferré" in details.lower() or "quatuor" in details.lower() or "sécurité" in details.lower()):
+                stats["victoires_par_ferrage"] = stats.get("victoires_par_ferrage", 0) + 1
 
     modele["stats_impact"] = stats
     sauvegarder_modele_ia(modele)
@@ -1167,8 +1213,8 @@ def retroaction_apprentissage_ia(pari, arrivee_trouvee, cotes_reelles, liste_par
     top_3 = ", ".join(arrivee_trouvee[:3]) if len(arrivee_trouvee) >= 3 else ", ".join(arrivee_trouvee)
     
     if statut == "Gagné":
-        diagnostic = f"✅ Succès validé. Arrivée : [{top_3}]. Gain net : +{profit:.2f}€. Modèle mis à jour."
+        diagnostic = f"✅ Succès validé. Arrivée : [{top_3}]. Gain net : +{profit:.2f}€. {explication_gagnant}"
     else:
-        diagnostic = f"❌ Échec enregistré. Arrivée réelle : [{top_3}]. Perte : {mise:.2f}€."
+        diagnostic = f"❌ Échec enregistré. Arrivée réelle : [{top_3}]. Perte : {mise:.2f}€. {explication_gagnant}"
         
     return diagnostic
