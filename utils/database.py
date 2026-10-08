@@ -159,17 +159,19 @@ def charger_historique():
 def sauvegarder_historique(historique):
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
+        cursor.execute("BEGIN TRANSACTION")
         cursor.execute("DELETE FROM paris")
-        for p in historique:
-            cursor.execute("""
-                INSERT INTO paris (date, reunion, course_num, course, discipline, type, details, mise, statut, gain, diagnostic)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
+        cursor.executemany("""
+            INSERT INTO paris (date, reunion, course_num, course, discipline, type, details, mise, statut, gain, diagnostic)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            (
                 p.get("date"), p.get("reunion"), p.get("course_num"), p.get("course"),
                 p.get("discipline"), p.get("type"), p.get("details"),
                 p.get("mise", 0.0), p.get("statut", "En attente"),
                 p.get("gain", 0.0), p.get("diagnostic", "")
-            ))
+            ) for p in historique
+        ])
         conn.commit()
 
 def charger_courses_jour_db(date_iso):

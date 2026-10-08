@@ -349,6 +349,7 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_jour, params_a
     tendance = cheval.get("tendance_cote", "stable")
     bonus_place = params_adaptatifs.get("bonus_place", 0)
 
+    # --- 1. MUSIQUE & FORME ---
     score_musique = 0
     for idx, char in enumerate(musique[:8]):
         if char == "1":
@@ -363,12 +364,23 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_jour, params_a
             score_musique -= 7 if (char in ["D", "T", "A"] and idx < 3) else 4
     score += score_musique * modele_ia.get("poids_musique", 1.05)
 
+    # --- 2. SPECIFICITÉS DISCIPLINE & CHRONO ---
     if "Trot" in str(discipline):
+        # Ferrage
         if "QUATRE" in deferre:
             score += 10.0 * modele_ia.get("poids_ferrage", 1.25)
         elif "ANTERIEURS" in deferre or "POSTERIEURS" in deferre:
             score += 5.5 * modele_ia.get("poids_ferrage", 1.25)
+            
+        # Vitesse pure / Réduction Kilométrique
+        red_kilo = safe_float(cheval.get("reduction_kilometrique"), 0.0)
+        if red_kilo > 0:
+            if red_kilo < 1.12:    # Très rapide (< 1'12")
+                score += 6.0 * modele_ia.get("poids_musique", 1.05)
+            elif red_kilo > 1.16:  # Lent pour les catégories élevées
+                score -= 4.0
     else:
+        # Plat / Obstacle : Poids & Terrain
         if poids > 0:
             if poids < 55.0:
                 score += 4.5 * modele_ia.get("poids_poids", 1.0)
@@ -377,6 +389,7 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_jour, params_a
         if terrain in ["Collant", "Lourd"] and ("LOURD" in musique or "SOUPLE" in musique):
             score += 7.0 * modele_ia.get("poids_terrain", 1.15)
 
+    # --- 3. CORDE ---
     poids_corde = modele_ia.get("poids_corde", 1.0)
     corde_str = str(corde).upper()
     if "GAUCHE" in corde_str and ("G" in musique or "GAUCHE" in musique):
@@ -386,11 +399,15 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_jour, params_a
     else:
         score += 1.0 * poids_corde
 
-    if tendance == "baisse_forte":
+    # --- 4. TENDANCE DE COTE (SMART MONEY) ---
+    if tendance == "baisse_tres_forte":
+        score += 10.0 * modele_ia.get("poids_cote_tendance", 1.35)
+    elif tendance == "baisse_forte":
         score += 6.5 * modele_ia.get("poids_cote_tendance", 1.35)
     elif tendance == "hausse":
         score -= 3.0 * modele_ia.get("poids_cote_tendance", 1.35)
 
+    # --- 5. DRIVER & DISTANCE ---
     mult_acteur = analyser_performances_acteur_par_hippodrome(driver, hippodrome)
     bonus_acteur = (mult_acteur - 1.0) * 10.0
     score += bonus_acteur * modele_ia.get("poids_driver", 1.15) * modele_ia.get("poids_hippodrome_acteur", 1.25)
@@ -399,6 +416,7 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_jour, params_a
     bonus_distance = (mult_distance - 1.0) * 5.0
     score += bonus_distance * modele_ia.get("poids_distance", 1.10)
 
+    # --- 6. NIVEAU DE COTE ---
     if cote > 1.0:
         if cote < 2.5:
             score += 6
@@ -409,10 +427,11 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_jour, params_a
         elif cote > 35.0:
             score -= 2
 
+    # --- 7. OUTSIDERS CACHÉS ---
     poids_outsider = modele_ia.get("poids_outsider_cache", 1.30)
     if 6.0 <= cote <= 30.0:
         bonus_joker = 0.0
-        if tendance == "baisse_forte":
+        if tendance in ["baisse_forte", "baisse_tres_forte"]:
             bonus_joker += 9.0
         if "Trot" in str(discipline) and "QUATRE" in deferre:
             bonus_joker += 7.0
@@ -423,6 +442,7 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_jour, params_a
     score += params_adaptatifs.get("malus_discipline", {}).get(discipline, 0)
     score_heuristique = max(0.0, round(score, 1))
 
+    # --- 8. HYBRIDATION MACHINE LEARNING (LIGHTGBM) ---
     try:
         ml_model = charger_modele_ml_cached()
         if ml_model is not None:
@@ -440,7 +460,13 @@ def calculer_valeur_esperee_avancee(chevaux_valides, nb_partants=12):
     if not chevaux_valides:
         return chevaux_valides
     temperature = 8.5
-    scores = [safe_float(c.get("score_analyse", 0)) for c in chevaux_valides]
+    
+    # Prise en compte de 'score_ia' OU 'score_analyse'
+    scores = [
+        safe_float(c.get("score_ia", c.get("score_analyse", 0))) 
+        for c in chevaux_valides
+    ]
+    
     max_score = max(scores, default=0.0)
     exp_scores = [math.exp((s - max_score) / temperature) for s in scores]
     somme_exp = sum(exp_scores)
@@ -506,16 +532,22 @@ def generer_plan_budget_journalier(date_iso, budget_total=50.0, params_adaptatif
         for c in chevaux:
             ev_g = safe_float(c.get("ev_index"), 0.0)
             ev_p = safe_float(c.get("ev_place_index"), 0.0)
-            if ev_g >= seuil_ev or ev_p >= seuil_ev:
+            
+            # Sélection selon le meilleur type de pari
+            est_gagnant = ev_g >= ev_p
+            proba_retenue = c.get("proba_estimee") if est_gagnant else c.get("proba_place")
+            
+            # FILTRE SÉCURITÉ : EV suffisant ET probabilité minimale de 8% pour éviter les cotes extrêmes
+            if (ev_g >= seuil_ev or ev_p >= seuil_ev) and safe_float(proba_retenue, 0.0) >= 0.08:
                 opportunites.append({
                     "Réunion": race.get("reunion"),
                     "Course": race.get("course"),
                     "Cheval": c.get("nom"),
                     "N°": c.get("num"),
-                    "Type": "Simple Gagnant" if ev_g >= ev_p else "Simple Placé",
+                    "Type": "Simple Gagnant" if est_gagnant else "Simple Placé",
                     "Cote": safe_float(c.get("cote")),
                     "EV": max(ev_g, ev_p),
-                    "Proba": c.get("proba_estimee") if ev_g >= ev_p else c.get("proba_place")
+                    "Proba": proba_retenue
                 })
 
     if not opportunites:
@@ -531,6 +563,7 @@ def generer_plan_budget_journalier(date_iso, budget_total=50.0, params_adaptatif
         df_opp["Mise (€)"] = round(budget_total / len(df_opp), 1)
 
     return df_opp[["Réunion", "Course", "N°", "Cheval", "Type", "Cote", "EV", "Mise (€)"]]
+
 
 def retroaction_apprentissage_ia(pari, arrivee_trouvee, cotes_reelles, partants_bruts):
     if not arrivee_trouvee:
@@ -551,3 +584,28 @@ def retroaction_apprentissage_ia(pari, arrivee_trouvee, cotes_reelles, partants_
     ajuster_seuil_value_bet_dynamique()
     
     return f"Résultat traité | Premier : N°{gagnant}"
+
+def ajuster_seuil_value_bet_dynamique():
+    """Ajuste le seuil Minimal Value Bet (EV) en fonction du ROI récent."""
+    try:
+        modele_ia = charger_modele_ia()
+        historique = charger_historique()
+        paris_regles = [p for p in historique if p.get("statut") in ["Gagné", "Perdu"]]
+        
+        if len(paris_regles) < 15:
+            return
+
+        derniers_paris = paris_regles[-20:]
+        mises = sum(safe_float(p.get("mise", 0)) for p in derniers_paris)
+        gains = sum(safe_float(p.get("gain", 0)) for p in derniers_paris if p.get("statut") == "Gagné")
+        roi_recent = ((gains - mises) / mises * 100) if mises > 0 else 0.0
+
+        seuil_actuel = float(modele_ia.get("seuil_value_bet", 1.85))
+        if roi_recent < -15.0:
+            modele_ia["seuil_value_bet"] = min(2.50, round(seuil_actuel + 0.05, 2))
+        elif roi_recent > 15.0:
+            modele_ia["seuil_value_bet"] = max(1.30, round(seuil_actuel - 0.05, 2))
+            
+        sauvegarder_modele_ia(modele_ia)
+    except Exception as e:
+        logger.error(f"Erreur lors de l'ajustement dynamique du seuil EV : {e}")
