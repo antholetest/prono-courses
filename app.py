@@ -11,7 +11,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import timedelta
-from utils.ai_model import optimiser_poids_ia_automatique
 
 # --- CONFIGURATION DES LOGS (Doit être en premier) ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -22,7 +21,8 @@ from utils.api_pmu import telecharger_pmu_date, safe_float, HEADERS
 from utils.ai_model import (
     charger_modele_ia, sauvegarder_modele_ia, calculer_parametres_adaptatifs,
     evaluer_score_cheval, normaliser_scores_chevaux, calculer_valeur_esperee_avancee,
-    generer_plan_budget_journalier, retroaction_apprentissage_ia
+    generer_plan_budget_journalier, retroaction_apprentissage_ia,
+    rafraichir_modele_ml, optimiser_poids_ia_automatique
 )
 
 # --- CONFIGURATION DE LA PAGE ---
@@ -94,10 +94,7 @@ def verifier_resultats_automatiques_pmu(historique):
     modifie = False
     dates_modifiees = set()
     
-    # Date du jour pour filtrer et ignorer les paris futurs qui n'ont pas encore de résultat
     aujourdhui = datetime.date.today()
-    
-    # On cible les paris en attente dont la date est passée ou d'aujourd'hui
     paris_en_attente = []
     for p in historique:
         if p.get("statut") == "En attente":
@@ -107,7 +104,6 @@ def verifier_resultats_automatiques_pmu(historique):
                 if dt_pari <= aujourdhui:
                     paris_en_attente.append(p)
             except Exception:
-                # Si le format de date est atypique, on l'inclut par précaution
                 paris_en_attente.append(p)
 
     total_a_verifier = len(paris_en_attente)
@@ -116,14 +112,12 @@ def verifier_resultats_automatiques_pmu(historique):
 
     progress_bar = st.progress(0, text="Vérification des résultats PMU...")
     i = 0
-    for p in paris_en_attente:  # On boucle directement sur la liste restreinte de paris en attente
+    for p in paris_en_attente:
         i += 1
         progress_bar.progress(min(1.0, i / total_a_verifier), text=f"Vérification pari {i}/{total_a_verifier} ({p.get('date', '')})...")
         
-        # Sauvegarde automatique toutes les 100 analyses
         if i % 100 == 0 and modifie:
             st.toast(f"Sauvegarde automatique intermédiaire : {i}/{total_a_verifier} paris traités.", icon="💾")
-            # Si votre script stocke l'historique dans le session_state :
             if "historique" in st.session_state:
                 st.session_state["historique"] = historique
 
@@ -175,7 +169,6 @@ def verifier_resultats_automatiques_pmu(historique):
             partants_arrives.sort(key=lambda x: x[0])
             arrivee_trouvee = [num for _, num in partants_arrives]
             
-            # Si les résultats/arrivées ne sont pas encore disponibles, on laisse en attente et on continue
             if not arrivee_trouvee:
                 continue
 
@@ -208,7 +201,6 @@ def verifier_resultats_automatiques_pmu(historique):
             p["gain"] = round(gain_total, 2)
             p["diagnostic"] = retroaction_apprentissage_ia(p, arrivee_trouvee, cotes_reelles, liste_partants_bruts)
             
-            # --- Enregistrement de l'arrivée pour l'apprentissage LightGBM ---
             try:
                 conn_db = sqlite3.connect(DB_PATH)
                 cur = conn_db.cursor()
@@ -228,13 +220,19 @@ def verifier_resultats_automatiques_pmu(historique):
                 conn_db.close()
             except Exception as e:
                 logger.error(f"Erreur mise à jour ordre arrivée cache : {e}")
-            # --------------------------------------------------------------------------
 
             modifie = True
             dates_modifiees.add(date_iso_norm)
         except Exception as e:
-            # En cas de coupure réseau ou d'erreur sur un pari, on ignore proprement et on continue la boucle
             continue
+
+    # --- AUTO-APPRENTISSAGE APRÈS VÉRIFICATION DES COURSES ---
+    if modifie:
+        # 1. Réentraînement du modèle LightGBM
+        rafraichir_modele_ml()
+        # 2. Optimisation automatique des poids heuristiques
+        optimiser_poids_ia_automatique()
+        logger.info("Auto-apprentissage IA et mise à jour des poids exécutés avec succès !")
 
     progress_bar.empty()
     return modifie
@@ -431,8 +429,6 @@ with tab_analyse:
             calculer_valeur_esperee_avancee(course_curr.get("chevaux", []), len(course_curr.get("chevaux", [])))
 
             chevaux_tries = sorted(course_curr.get("chevaux", []), key=lambda x: x.get("ev_index", 0), reverse=True)
-            
-            # Stockage des chevaux analysés dans la session pour pouvoir les parier
             st.session_state["chevaux_analyse_courant"] = chevaux_tries
 
             st.dataframe([{
@@ -441,7 +437,6 @@ with tab_analyse:
                 "EV Gagnant": c.get("ev_index"), "EV Placé": c.get("ev_place_index")
             } for c in chevaux_tries], width="stretch")
 
-        # --- BOUTON DE VALIDATION & ENREGISTREMENT DU PARI ---
         if "chevaux_analyse_courant" in st.session_state and st.session_state["chevaux_analyse_courant"]:
             st.divider()
             st.markdown("### 📝 Enregistrer un pari sur cette course analysée")
@@ -502,7 +497,6 @@ with tab_analyse:
                 plan_df = pd.DataFrame(plan_data)
                 st.dataframe(plan_df, width="stretch")
 
-            # --- BOUTON DE VALIDATION DU PLAN D'ALLOCATION ---
             if st.button("⚡ Valider & Enregistrer le Plan d'Allocation Optimal", key="btn_valider_plan_allocation"):
                 hist = charger_historique()
                 nouveaux_paris = []
@@ -559,6 +553,8 @@ with tab_ia:
             poids_cote_tendance = st.slider("Poids Tendance Cote", 0.1, 3.0, float(modele.get("poids_cote_tendance", 1.35)), 0.05)
             poids_driver = st.slider("Poids Driver", 0.1, 3.0, float(modele.get("poids_driver", 1.15)), 0.05)
             poids_corde = st.slider("Poids Corde", 0.1, 3.0, float(modele.get("poids_corde", 1.0)), 0.05)
+            poids_hippodrome = st.slider("Poids Hippodrome/Acteur", 0.1, 3.0, float(modele.get("poids_hippodrome_acteur", 1.25)), 0.05)
+            poids_distance = st.slider("Poids Distance", 0.1, 3.0, float(modele.get("poids_distance", 1.10)), 0.05)
             poids_outsider_cache = st.slider("Poids Outsiders Cachés", 0.1, 3.0, float(modele.get("poids_outsider_cache", 1.30)), 0.05)
             
             seuil_ev = st.number_input("Seuil Minimal Value Bet (EV)", 1.0, 3.0, float(modele.get("seuil_value_bet", 1.50)), 0.05)
@@ -571,6 +567,8 @@ with tab_ia:
                 modele["poids_cote_tendance"] = poids_cote_tendance
                 modele["poids_driver"] = poids_driver
                 modele["poids_corde"] = poids_corde
+                modele["poids_hippodrome_acteur"] = poids_hippodrome
+                modele["poids_distance"] = poids_distance
                 modele["poids_outsider_cache"] = poids_outsider_cache
                 modele["seuil_value_bet"] = seuil_ev
                 sauvegarder_modele_ia(modele)
@@ -597,6 +595,7 @@ with tab_ia:
         
         params_actuels = calculer_parametres_adaptatifs()
         st.info(f"💡 Message Modèle Adaptatif : {params_actuels.get('message_auto')}")
+
 # ================= 5. SUIVI & ROI FINANCIER =================
 with tab_suivi:
     st.subheader("📈 Suivi Financier, ROI & Tests Statistiques")
@@ -695,8 +694,6 @@ with tab_admin:
                 nb_jours = delta.days + 1
                 
                 total_paris_ajoutes = 0
-                
-                # Charger l'historique une seule fois pour identifier les dates déjà traitées
                 historique_actuel = charger_historique()
                 dates_deja_traitees = {str(p.get("date"))[:10] for p in historique_actuel if "Auto" in p.get("type", "")}
                 
@@ -704,7 +701,6 @@ with tab_admin:
                     courante_dt = date_debut + datetime.timedelta(days=i)
                     courante_iso = courante_dt.strftime("%Y-%m-%d")
                     
-                    # --- REPRISE AUTOMATIQUE : Si la date est déjà dans l'historique, on la saute ---
                     if courante_iso in dates_deja_traitees:
                         st.info(f"⏭️ Date {courante_iso} déjà traitée (reprise automatique : ignorée pour éviter les doublons).")
                         continue
@@ -712,28 +708,22 @@ with tab_admin:
                     st.markdown(f"### 📅 Traitement du : {courante_iso}")
                     
                     try:
-                        # 1. Vérifier d'abord si les courses du jour sont déjà présentes en base (cache local)
                         donnees_jour, _ = charger_courses_jour_db(courante_iso)
-                        
-                        # 2. Si elles ne sont pas présentes, on lance le téléchargement
                         if not donnees_jour:
                             st.info(f"📥 Téléchargement des courses pour le {courante_iso}...")
                             succes_dl = telecharger_pmu_date(courante_iso, None)
-                            
                             if not succes_dl:
-                                st.warning(f"Impossible de récupérer les données pour le {courante_iso} (pas de courses ou date trop ancienne).")
+                                st.warning(f"Impossible de récupérer les données pour le {courante_iso}.")
                                 continue
-                                
-                            # Recharger les courses fraîchement téléchargées depuis la base
                             donnees_jour, _ = charger_courses_jour_db(courante_iso)
                         else:
-                            st.success(f"⚡ Courses déjà présentes en base pour le {courante_iso} (téléchargement ignoré).")
+                            st.success(f"⚡ Courses déjà présentes en base pour le {courante_iso}.")
 
                         if not donnees_jour:
                             continue
                             
                         nb_courses_jour = 0
-                        paris_du_jour = []  # Liste temporaire pour accumuler les paris de cette seule journée
+                        paris_du_jour = []
                         
                         for c_elem in donnees_jour:
                             nom_c = str(c_elem.get("nom_course", "")).strip()
@@ -747,7 +737,6 @@ with tab_admin:
                             if not chevaux_val_c:
                                 continue
                                 
-                            # 3. Application de l'analyse IA / Value Bet
                             params_ad_chrono = calculer_parametres_adaptatifs()
                             for c in chevaux_val_c:
                                 c["score_analyse"] = evaluer_score_cheval(
@@ -783,7 +772,6 @@ with tab_admin:
                             total_paris_ajoutes += 1
                             nb_courses_jour += 1
                             
-                        # 4. ENREGISTREMENT DIRECT DE LA JOURNÉE EN COURS
                         if paris_du_jour:
                             historique_actuel.extend(paris_du_jour)
                             sauvegarder_historique(historique_actuel)
@@ -809,7 +797,6 @@ with tab_admin:
                 migrer_anciens_json_vers_sqlite()
                 st.success("Migration et initialisation de la base de données effectuées.")
 
-# --- NOUVELLE SECTION : NETTOYAGE DES PARIS EN ATTENTE EXPIRÉS ---
         st.divider()
         st.subheader("🧹 Nettoyage des Paris en Attente Expirés")
         st.markdown("Supprimez automatiquement les paris restés **'En attente'** dont la date est trop ancienne et qui n'ont pas de résultat.")
@@ -824,7 +811,6 @@ with tab_admin:
                     date_limite = datetime.date.today() - datetime.timedelta(days=int(nb_jours_del))
                     date_limite_str = date_limite.strftime("%Y-%m-%d")
                     
-                    # 1. Suppression directe dans la table SQLite 'paris'
                     conn = sqlite3.connect(DB_PATH)
                     cursor = conn.cursor()
                     cursor.execute("DELETE FROM paris WHERE statut = 'En attente' AND date < ?", (date_limite_str,))
@@ -832,7 +818,6 @@ with tab_admin:
                     conn.commit()
                     conn.close()
                     
-                    # 2. Mise à jour de l'historique global (sécurité fichiers/JSON)
                     hist = charger_historique()
                     nouveaux_hist = []
                     supp_hist_count = 0
@@ -856,7 +841,6 @@ with tab_admin:
                 except Exception as e:
                     st.error(f"Erreur lors du nettoyage des paris en attente : {e}")
                     
-        # --- NOUVELLE ZONE : REMISE À ZÉRO COMPLÈTE ---
         st.divider()
         st.subheader("⚠️ Zone Dangereuse : Remise à Zéro Complète")
         st.markdown("Cette action supprimera définitivement **tous les paris enregistrés, les courses en cache et l'historique** de la base de données.")
@@ -865,7 +849,6 @@ with tab_admin:
         if confirm_raz:
             if st.button("🗑️ Supprimer TOUTES les données acquises", key="btn_raz_total", type="primary"):
                 try:
-                    # Connexion à la base et suppression de toutes les lignes de chaque table (évite le blocage Windows)
                     conn = sqlite3.connect(DB_PATH)
                     cursor = conn.cursor()
                     cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
@@ -877,7 +860,6 @@ with tab_admin:
                     conn.commit()
                     conn.close()
                     
-                    # Réinitialisation et vidage du cache Streamlit
                     init_db()
                     st.cache_data.clear()
                     
