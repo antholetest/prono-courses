@@ -19,7 +19,7 @@ def get_connection():
         url = st.secrets.get("TURSO_DATABASE_URL")
         token = st.secrets.get("TURSO_AUTH_TOKEN")
         if url and token:
-            import libsql_experimental as libsql
+            import libsql
             return libsql.connect(database=url, auth_token=token)
     except Exception as e:
         logger.warning(f"Connexion Turso non configurée ou indisponible, bascule sur SQLite locale : {e}")
