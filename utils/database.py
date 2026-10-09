@@ -15,14 +15,17 @@ def get_connection():
     Retourne une connexion vers Turso (Cloud) si disponible dans st.secrets,
     sinon bascule sur le fichier SQLite local.
     """
-    try:
-        url = st.secrets.get("TURSO_DATABASE_URL")
-        token = st.secrets.get("TURSO_AUTH_TOKEN")
-        if url and token:
+    url = st.secrets.get("TURSO_DATABASE_URL")
+    token = st.secrets.get("TURSO_AUTH_TOKEN")
+    
+    if url and token:
+        try:
             import libsql
             return libsql.connect(database=url, auth_token=token)
-    except Exception as e:
-        logger.warning(f"Connexion Turso non configurée ou indisponible, bascule sur SQLite locale : {e}")
+        except Exception as e:
+            logger.error(f"⚠️ ERREUR CONNEXION TURSO : {e}")
+    else:
+        logger.warning("TURSO: URL ou Token manquant dans st.secrets. Bascule sur SQLite local.")
     
     return sqlite3.connect(DB_PATH)
 
@@ -73,7 +76,6 @@ def init_db():
         )
     """)
     
-    # Ajout d'index pour optimiser les performances de recherche et de filtrage
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_paris_date ON paris(date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_paris_statut ON paris(statut)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_courses_cache_date ON courses_cache(date_iso)")
@@ -90,7 +92,10 @@ def migrer_anciens_json_vers_sqlite():
     f_hist = DOSSIER / "historique_paris.json"
     if f_hist.exists():
         cursor.execute("SELECT COUNT(*) FROM paris")
-        if cursor.fetchone()[0] == 0:
+        first_row = cursor.fetchone()
+        count_val = first_row[0] if isinstance(first_row, (tuple, list)) else first_row["COUNT(*)"] if isinstance(first_row, dict) else 0
+        
+        if count_val == 0:
             try:
                 with open(f_hist, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -116,7 +121,10 @@ def migrer_anciens_json_vers_sqlite():
     f_modele = DOSSIER / "modele_ia_pmu.json"
     if f_modele.exists():
         cursor.execute("SELECT COUNT(*) FROM modele_ia")
-        if cursor.fetchone()[0] == 0:
+        first_row = cursor.fetchone()
+        count_val = first_row[0] if isinstance(first_row, (tuple, list)) else first_row["COUNT(*)"] if isinstance(first_row, dict) else 0
+        
+        if count_val == 0:
             try:
                 with open(f_modele, "r", encoding="utf-8") as f:
                     modele_data = json.load(f)
@@ -175,7 +183,14 @@ def charger_historique():
     conn.close()
     
     colonnes = ["id", "date", "reunion", "course_num", "course", "discipline", "type", "details", "mise", "statut", "gain", "diagnostic"]
-    return [dict(zip(colonnes, row)) for row in rows]
+    
+    resultats = []
+    for row in rows:
+        if isinstance(row, dict):
+            resultats.append(row)
+        else:
+            resultats.append(dict(zip(colonnes, row)))
+    return resultats
 
 def sauvegarder_historique(historique):
     conn = get_connection()
@@ -201,7 +216,11 @@ def charger_courses_jour_db(date_iso):
     rows = cursor.fetchall()
     conn.close()
     
-    donnees = [json.loads(row[0]) for row in rows]
+    donnees = []
+    for row in rows:
+        valeur_json = row["data_json"] if isinstance(row, dict) else row[0]
+        donnees.append(json.loads(valeur_json))
+        
     reunions_map = {}
     for elem in donnees:
         cle = f"{elem.get('reunion', 'R?')} - {elem.get('hippodrome', 'Hippodrome')}"
