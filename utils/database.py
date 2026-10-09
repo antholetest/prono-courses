@@ -11,23 +11,21 @@ DOSSIER = Path(".")
 DB_PATH = DOSSIER / "pmu_database.db"
 
 def get_connection():
-    """
-    Retourne une connexion vers Turso (Cloud) si disponible dans st.secrets,
-    sinon bascule sur le fichier SQLite local.
-    """
     url = st.secrets.get("TURSO_DATABASE_URL")
     token = st.secrets.get("TURSO_AUTH_TOKEN")
     
-    if url and token:
-        try:
-            import libsql
-            return libsql.connect(database=url, auth_token=token)
-        except Exception as e:
-            logger.error(f"⚠️ ERREUR CONNEXION TURSO : {e}")
-    else:
-        logger.warning("TURSO: URL ou Token manquant dans st.secrets. Bascule sur SQLite local.")
+    if not url or not token:
+        logger.error("❌ TURSO : Identifiants introuvables dans st.secrets !")
+        return sqlite3.connect(DB_PATH)
     
-    return sqlite3.connect(DB_PATH)
+    try:
+        import libsql
+        conn = libsql.connect(database=url, auth_token=token)
+        logger.info("✅ TURSO : Connexion Cloud réussie !")
+        return conn
+    except Exception as e:
+        logger.error(f"❌ ERREUR TURSO EXACTE : {e}")
+        return sqlite3.connect(DB_PATH)
 
 def init_db():
     conn = get_connection()
