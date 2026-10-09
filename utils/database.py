@@ -11,21 +11,23 @@ DOSSIER = Path(".")
 DB_PATH = DOSSIER / "pmu_database.db"
 
 def get_connection():
+    """
+    Retourne une connexion vers Turso (Cloud) si disponible dans st.secrets,
+    sinon bascule sur le fichier SQLite local.
+    """
     url = st.secrets.get("TURSO_DATABASE_URL")
     token = st.secrets.get("TURSO_AUTH_TOKEN")
     
-    if not url or not token:
-        logger.error("❌ TURSO : Identifiants introuvables dans st.secrets !")
-        return sqlite3.connect(DB_PATH)
+    if url and token:
+        try:
+            import libsql
+            return libsql.connect(database=url, auth_token=token)
+        except Exception as e:
+            logger.error(f"❌ ERREUR TURSO EXACTE : {e}")
+    else:
+        logger.warning("TURSO: Identifiants introuvables dans st.secrets. Bascule sur SQLite local.")
     
-    try:
-        import libsql
-        conn = libsql.connect(database=url, auth_token=token)
-        logger.info("✅ TURSO : Connexion Cloud réussie !")
-        return conn
-    except Exception as e:
-        logger.error(f"❌ ERREUR TURSO EXACTE : {e}")
-        return sqlite3.connect(DB_PATH)
+    return sqlite3.connect(DB_PATH)
 
 def init_db():
     conn = get_connection()
@@ -79,7 +81,6 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_courses_cache_date ON courses_cache(date_iso)")
     
     conn.commit()
-    conn.close()
     logger.info("Base de données initialisée avec succès.")
 
 def migrer_anciens_json_vers_sqlite():
@@ -171,14 +172,11 @@ def migrer_anciens_json_vers_sqlite():
         except Exception as e:
             logger.error(f"Erreur migration bilan {f_json.name}: {e}")
 
-    conn.close()
-
 def charger_historique():
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, date, reunion, course_num, course, discipline, type, details, mise, statut, gain, diagnostic FROM paris")
     rows = cursor.fetchall()
-    conn.close()
     
     colonnes = ["id", "date", "reunion", "course_num", "course", "discipline", "type", "details", "mise", "statut", "gain", "diagnostic"]
     
@@ -205,14 +203,12 @@ def sauvegarder_historique(historique):
             p.get("gain", 0.0), p.get("diagnostic", "")
         ))
     conn.commit()
-    conn.close()
 
 def charger_courses_jour_db(date_iso):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT data_json FROM courses_cache WHERE date_iso = ?", (date_iso,))
     rows = cursor.fetchall()
-    conn.close()
     
     donnees = []
     for row in rows:
@@ -239,4 +235,3 @@ def sauvegarder_courses_jour_db(date_iso, resultat_journee):
             VALUES (?, ?, ?, ?)
         """, (date_iso, reunion, course_num, json.dumps(course, ensure_ascii=False)))
     conn.commit()
-    conn.close()
