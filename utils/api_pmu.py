@@ -1,9 +1,10 @@
-# utils/api_pmu.py
 import datetime
 import logging
 import requests
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 from utils.database import DB_PATH, sauvegarder_courses_jour_db
 from utils.helpers import safe_float
 
@@ -14,6 +15,20 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     )
 }
+
+def creer_session_avec_retry():
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(HEADERS)
+    return session
 
 def detecter_discipline(course_obj):
     api_disc = str(course_obj.get("discipline", "")).upper()
@@ -69,7 +84,6 @@ def detecter_etat_terrain(conditions_texte):
     return "Bon (Standard)"
 
 def _traiter_une_course(session, date_pmu, num_r, hippodrome, course):
-    """Fonction exécutée en parallèle pour une course donnée."""
     num_c = f"C{course.get('numOrdre')}"
     nom_course = course.get("libelle", "")
     discipline = detecter_discipline(course)
@@ -160,12 +174,8 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
         logger.warning(f"Format de date invalide pour l'API PMU ({date_iso}) : {e}")
         return False
 
-    url_programme = (
-        f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}"
-    )
-    
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    url_programme = f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}"
+    session = creer_session_avec_retry()
 
     try:
         res = session.get(url_programme, timeout=15)
@@ -182,7 +192,6 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
         logger.info(f"Aucune réunion trouvée pour la date {date_iso}.")
         return False
 
-    # Préparation de toutes les tâches de courses à lancer en parallèle
     taches_courses = []
     for reunion in reunions:
         num_r = f"R{reunion.get('numOfficiel')}"
@@ -196,8 +205,8 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
     progress_bar = st.progress(0, text="Téléchargement des programmes en cours (Multi-thread)...") if afficher_progres else None
     courses_terminees = 0
 
-    # Exécution en parallèle (ThreadPoolExecutor avec 10 requêtes simultanées max)
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    # Réduit à 5 threads max pour protéger le pool de connexions Supabase
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(_traiter_une_course, *tache): tache for tache in taches_courses}
         
         for future in as_completed(futures):
@@ -215,6 +224,8 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
     if afficher_progres and progress_bar:
         progress_bar.empty()
         
-    sauvegarder_courses_jour_db(date_iso, resultats_journee)
-    logger.info(f"Téléchargement et mise en cache réussis pour la date {date_iso}.")
-    return True
+    if resultats_journee:
+        sauvegarder_courses_jour_db(date_iso, resultats_journee)
+        logger.info(f"Téléchargement et mise en cache réussis pour la date {date_iso}.")
+        return True
+    return False

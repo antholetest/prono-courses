@@ -251,6 +251,19 @@ def verifier_resultats_automatiques_pmu(historique):
             continue
 
     progress_bar.empty()
+
+    # --- AUTOMATISATION DE L'APPRENTISSAGE GLOBAL EN ARRIÈRE-PLAN ---
+    if modifie:
+        try:
+            # Appel direct de la fonction d'optimisation automatique des poids
+            succes_opt, msg_opt = optimiser_poids_ia_automatique()
+            if succes_opt:
+                logger.info(f"Apprentissage IA automatique post-vérification : {msg_opt}")
+            else:
+                logger.debug(f"Apprentissage IA non appliqué (conditions non remplies) : {msg_opt}")
+        except Exception as e:
+            logger.error(f"Erreur lors de l'apprentissage IA automatique : {e}")
+
     return modifie
 
 def analyser_roi_par_discipline_sql():
@@ -640,7 +653,7 @@ with tab_suivi:
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     kpi1.metric("Total Mises", f"{total_mises:.2f} €")
     kpi2.metric("Total Gains", f"{total_gains:.2f} €")
-    kpi3.metric("Bilan Net", f"{bilan_net:+.2f} €")
+    kpi3.metric("Bilan Net", f"{bilan_net:+.2f} €", delta=f"{bilan_net:+.2f} €")
     kpi4.metric("ROI / Taux Réussite", f"{roi:+.1f}% | Win: {taux_win:.1f}%")
 
     st.divider()
@@ -663,9 +676,18 @@ with tab_suivi:
             st.info("Pas assez de paris pour Monte Carlo (min. 10).")
 
     st.divider()
-    st.subheader("📋 Historique Détaillé des Paris")
+    st.subheader("📋 Historique Détaillé des Paris (Paginé)")
     if historique:
-        st.dataframe(pd.DataFrame(historique), width="stretch")
+        df_hist = pd.DataFrame(historique)
+        elements_par_page = 25
+        total_pages = max(1, math.ceil(len(df_hist) / elements_par_page))
+        page_courante = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
+        
+        debut = (page_courante - 1) * elements_par_page
+        fin = debut + elements_par_page
+        
+        st.dataframe(df_hist.iloc[debut:fin], width="stretch")
+        st.caption(affichage := f"Affichage des paris {debut + 1} à {min(fin, len(df_hist))} sur un total de {len(df_hist)}")
     else:
         st.info("Aucun pari enregistré.")
 
