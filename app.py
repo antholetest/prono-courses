@@ -345,6 +345,49 @@ with tab_accueil:
     col3.metric("Mises Totales", f"{mises_totales:.2f} €")
     col4.metric("Bilan Net", f"{gains_totaux - mises_totales:.2f} €", delta=f"{gains_totaux - mises_totales:.2f} €")
 
+    # --- NOUVEAU : Suivi de la progression de l'IA (Taux de réussite & ROI cumulé en %) ---
+    st.divider()
+    st.subheader("🧠 Évolution de la Performance de l'IA (Progression & Fiabilité)")
+    
+    paris_regles = [p for p in historique if str(p.get("statut", "")).strip().lower() in ["gagné", "perdu"]]
+    
+    if len(paris_regles) >= 5:
+        df_ia = pd.DataFrame(paris_regles)
+        df_ia["date"] = pd.to_datetime(df_ia["date"], errors="coerce")
+        df_ia = df_ia.dropna(subset=["date"]).sort_values("date")
+        
+        # Transformer le statut en 1 (gagné) ou 0 (perdu)
+        df_ia["est_gagne"] = df_ia["statut"].apply(lambda s: 1 if str(s).strip().lower() == "gagné" else 0)
+        
+        # Calculer un taux de réussite glissant (fenêtre de 20 paris ou cumul progressif)
+        # Ici on fait un taux de réussite cumulé progressif pour voir la tendance de l'IA
+        df_ia["Taux de Réussite Cumulé (%)"] = (df_ia["est_gagne"].expanding().mean() * 100).round(1)
+        
+        # Affichage de la courbe de progression de la précision
+        st.markdown("##### 📈 Courbe du Taux de Réussite Global de l'IA au fil du temps (%)")
+        st.line_chart(df_ia.set_index("date")["Taux de Réussite Cumulé (%)"], use_container_width=True)
+        
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            # Afficher aussi l'évolution du ROI en % si possible
+            df_ia["mise_num"] = df_ia["mise"].apply(safe_float)
+            df_ia["gain_num"] = df_ia["gain"].apply(safe_float)
+            df_ia["profit_cumul"] = (df_ia["gain_num"] - df_ia["mise_num"]).cumsum()
+            df_ia["mises_cumul"] = df_ia["mise_num"].cumsum()
+            df_ia["ROI Cumulé (%)"] = ((df_ia["profit_cumul"] / df_ia["mises_cumul"]) * 100).fillna(0).round(1)
+            
+            st.markdown("##### 📊 Évolution du ROI de l'IA (%)")
+            st.line_chart(df_ia.set_index("date")["ROI Cumulé (%)"], use_container_width=True)
+            
+        with col_p2:
+            st.info("""
+            **Comment lire cette progression :**
+            * **Le Taux de Réussite Cumulé (%)** montre si l'IA cible de mieux en mieux les chevaux gagnants/placés au fur et à mesure que son modèle apprend.
+            * **Le ROI Cumulé (%)** indique si la stratégie de sélection devient globalement plus rentable par rapport aux sommes misées.
+            """)
+    else:
+        st.info("Il faut au moins 5 paris réglés (Gagné/Perdu) pour afficher la courbe de progression de l'IA.")
+
 # ================= 2. CHRONO DES COURSES =================
 with tab_chrono:
     st.subheader("⏰ Programme Chronologique & Sélection Value Bets")
