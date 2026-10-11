@@ -5,3 +5,4 @@ lightgbm
 scikit-learn
 requests
 libsql
+psycopg2-binary
