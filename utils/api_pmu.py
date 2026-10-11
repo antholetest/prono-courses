@@ -3,7 +3,9 @@ import datetime
 import logging
 import requests
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils.database import DB_PATH, sauvegarder_courses_jour_db
+from utils.helpers import safe_float
 
 logger = logging.getLogger("PMU_Pro")
 
@@ -12,14 +14,6 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     )
 }
-
-def safe_float(val, default=0.0):
-    if val is None or val == "" or val == "-":
-        return default
-    try:
-        return float(str(val).replace(",", ".").replace("€", "").strip())
-    except (ValueError, TypeError):
-        return default
 
 def detecter_discipline(course_obj):
     api_disc = str(course_obj.get("discipline", "")).upper()
@@ -73,6 +67,90 @@ def detecter_etat_terrain(conditions_texte):
             else "Souple"
         )
     return "Bon (Standard)"
+
+def _traiter_une_course(session, date_pmu, num_r, hippodrome, course):
+    """Fonction exécutée en parallèle pour une course donnée."""
+    num_c = f"C{course.get('numOrdre')}"
+    nom_course = course.get("libelle", "")
+    discipline = detecter_discipline(course)
+    conditions_course = course.get("conditions", "")
+    terrain_detecte = detecter_etat_terrain(conditions_course)
+    corde_detectee = detecter_corde(nom_course, conditions_course)
+    distance_val = course.get("distance") or course.get("distanceTotale", "")
+    
+    heure_str = "13:30"
+    valeurs_a_tester = [
+        course.get("dateTheoriqueDepart"),
+        course.get("heureDepart"),
+        course.get("pariHeureDepart"),
+    ]
+    for val in valeurs_a_tester:
+        if val:
+            try:
+                if isinstance(val, (int, float)) and val > 100000:
+                    diviseur = 1000.0 if val > 1e10 else 1.0
+                    dt_utc = datetime.datetime.fromtimestamp(
+                        val / diviseur, datetime.timezone.utc
+                    )
+                    dt_local = dt_utc.astimezone()
+                    heure_str = f"{dt_local.hour:02d}:{dt_local.minute:02d}"
+                    break
+            except Exception:
+                pass
+
+    url_partants = f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{num_r}/{num_c}/participants"
+    chevaux = []
+    try:
+        res_part = session.get(url_partants, timeout=10)
+        if res_part.status_code == 200:
+            for part_item in res_part.json().get("participants", []):
+                rapport_direct = part_item.get("dernierRapportDirect")
+                cote_val = (
+                    rapport_direct.get("rapport")
+                    if isinstance(rapport_direct, dict)
+                    else None
+                )
+
+                rapport_ref = part_item.get("rapportReference")
+                cote_ouv = (
+                    rapport_ref.get("rapport")
+                    if isinstance(rapport_ref, dict)
+                    else cote_val
+                )
+
+                tendance = "stable"
+                if cote_val and cote_ouv:
+                    if cote_val < cote_ouv * 0.85:
+                        tendance = "baisse_forte"
+                    elif cote_val > cote_ouv * 1.15:
+                        tendance = "hausse"
+
+                chevaux.append({
+                    "num": part_item.get("numPmu"),
+                    "nom": part_item.get("nom"),
+                    "driver": part_item.get("driver", part_item.get("jockey", "")),
+                    "musique": part_item.get("musique", ""),
+                    "deferre": part_item.get("deferre", ""),
+                    "poids": safe_float(part_item.get("poids", 0.0)),
+                    "cote": cote_val,
+                    "tendance_cote": tendance,
+                })
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des partants pour {num_r} {num_c} : {e}")
+
+    return {
+        "reunion": num_r,
+        "hippodrome": hippodrome,
+        "course": num_c,
+        "nom_course": nom_course,
+        "discipline": discipline,
+        "distance": distance_val,
+        "terrain_officiel": terrain_detecte,
+        "corde": corde_detectee,
+        "heure": heure_str,
+        "chevaux": chevaux,
+    }
+
 @st.cache_data
 def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
     try:
@@ -86,14 +164,13 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
         f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}"
     )
     
-    # Utilisation d'une Session pour optimiser les performances réseau
     session = requests.Session()
     session.headers.update(HEADERS)
 
     try:
         res = session.get(url_programme, timeout=15)
         if res.status_code != 200:
-            logger.warning(f"Impossible de récupérer le programme PMU pour {date_iso} (Code HTTP: {res.status_code})[cite: 13]")
+            logger.warning(f"Impossible de récupérer le programme PMU pour {date_iso} (Code HTTP: {res.status_code})")
             return False
         data = res.json()
     except Exception as e:
@@ -105,106 +182,39 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
         logger.info(f"Aucune réunion trouvée pour la date {date_iso}.")
         return False
 
-    resultats_journee = []
-    total_courses = sum(len(r.get("courses", [])) for r in reunions)
-    courses_traitees = 0
-    
-    progress_bar = st.progress(0, text="Téléchargement des programmes en cours...") if afficher_progres else None
-
+    # Préparation de toutes les tâches de courses à lancer en parallèle
+    taches_courses = []
     for reunion in reunions:
         num_r = f"R{reunion.get('numOfficiel')}"
         hippodrome = reunion.get("hippodrome", {}).get("libelleLong", "")
-
         for course in reunion.get("courses", []):
-            courses_traitees += 1
+            taches_courses.append((session, date_pmu, num_r, hippodrome, course))
+
+    total_courses = len(taches_courses)
+    resultats_journee = []
+    
+    progress_bar = st.progress(0, text="Téléchargement des programmes en cours (Multi-thread)...") if afficher_progres else None
+    courses_terminees = 0
+
+    # Exécution en parallèle (ThreadPoolExecutor avec 10 requêtes simultanées max)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(_traiter_une_course, *tache): tache for tache in taches_courses}
+        
+        for future in as_completed(futures):
+            courses_terminees += 1
             if afficher_progres and progress_bar and total_courses > 0:
-                prog_val = min(1.0, courses_traitees / total_courses)
-                progress_bar.progress(prog_val, text=f"Téléchargement : {num_r} - Course {courses_traitees}/{total_courses}")
-
-            num_c = f"C{course.get('numOrdre')}"
-            nom_course = course.get("libelle", "")
-            discipline = detecter_discipline(course)
-            conditions_course = course.get("conditions", "")
-            terrain_detecte = detecter_etat_terrain(conditions_course)
-            corde_detectee = detecter_corde(nom_course, conditions_course)
-            distance_val = course.get("distance") or course.get("distanceTotale", "")
-            
-            heure_str = "13:30"
-            valeurs_a_tester = [
-                course.get("dateTheoriqueDepart"),
-                course.get("heureDepart"),
-                course.get("pariHeureDepart"),
-            ]
-            for val in valeurs_a_tester:
-                if val:
-                    try:
-                        if isinstance(val, (int, float)) and val > 100000:
-                            diviseur = 1000.0 if val > 1e10 else 1.0
-                            dt_utc = datetime.datetime.fromtimestamp(
-                                val / diviseur, datetime.timezone.utc
-                            )
-                            dt_local = dt_utc.astimezone()
-                            heure_str = f"{dt_local.hour:02d}:{dt_local.minute:02d}"
-                            break
-                    except Exception:
-                        pass
-
-            url_partants = f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{num_r}/{num_c}/participants"
+                prog_val = min(1.0, courses_terminees / total_courses)
+                progress_bar.progress(prog_val, text=f"Téléchargement parallèle : {courses_terminees}/{total_courses} courses")
             try:
-                res_part = session.get(url_partants, timeout=10)
-                chevaux = []
-                if res_part.status_code == 200:
-                    for p in res_part.json().get("participants", []):
-                        rapport_direct = p.get("dernierRapportDirect")
-                        cote_val = (
-                            rapport_direct.get("rapport")
-                            if isinstance(rapport_direct, dict)
-                            else None
-                        )
-
-                        rapport_ref = p.get("rapportReference")
-                        cote_ouv = (
-                            rapport_ref.get("rapport")
-                            if isinstance(rapport_ref, dict)
-                            else cote_val
-                        )
-
-                        tendance = "stable"
-                        if cote_val and cote_ouv:
-                            if cote_val < cote_ouv * 0.85:
-                                tendance = "baisse_forte"
-                            elif cote_val > cote_ouv * 1.15:
-                                tendance = "hausse"
-
-                        chevaux.append({
-                            "num": p.get("numPmu"),
-                            "nom": p.get("nom"),
-                            "driver": p.get("driver", p.get("jockey", "")),
-                            "musique": p.get("musique", ""),
-                            "deferre": p.get("deferre", ""),
-                            "poids": safe_float(p.get("poids", 0.0)),
-                            "cote": cote_val,
-                            "tendance_cote": tendance,
-                        })
-                resultats_journee.append({
-                    "reunion": num_r,
-                    "hippodrome": hippodrome,
-                    "course": num_c,
-                    "nom_course": nom_course,
-                    "discipline": discipline,
-                    "distance": distance_val,
-                    "terrain_officiel": terrain_detecte,
-                    "corde": corde_detectee,
-                    "heure": heure_str,
-                    "chevaux": chevaux,
-                })
+                res_course = future.result()
+                if res_course:
+                    resultats_journee.append(res_course)
             except Exception as e:
-                logger.error(f"Erreur lors de la récupération des partants pour {num_r} {num_c} : {e}")
+                logger.error(f"Erreur thread course : {e}")
 
     if afficher_progres and progress_bar:
         progress_bar.empty()
         
     sauvegarder_courses_jour_db(date_iso, resultats_journee)
-    st.cache_data.clear()
     logger.info(f"Téléchargement et mise en cache réussis pour la date {date_iso}.")
     return True

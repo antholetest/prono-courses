@@ -1,25 +1,42 @@
-import sqlite3
-import pandas as pd
-from utils.database import DB_PATH
+# utils/__init__.py
+from utils.database import (
+    get_conn,
+    save_bet_to_db,
+    load_bets_from_db,
+    update_bet_status,
+    get_bankroll,
+    update_bankroll,
+    save_prediction_cache,
+    get_prediction_cache,
+    DB_PATH,
+    get_connection,
+    init_db,
+    migrer_anciens_json_vers_sqlite,
+    charger_historique,
+    sauvegarder_historique,
+    charger_courses_jour_db,
+    sauvegarder_courses_jour_db,
+    analyser_roi_par_discipline_sql,
+    analyser_bilan_journalier_sql
+)
 
-def init_db(db_name=DB_PATH):
-    """Initialise la base de données et les tables nécessaires."""
-    conn = sqlite3.connect(db_name)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS races (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT,
-            reunion TEXT,
-            course TEXT,
-            data TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def save_to_db(df, table_name="races", db_name=DB_PATH):
-    """Sauvegarde un DataFrame dans SQLite."""
-    conn = sqlite3.connect(db_name)
-    df.to_sql(table_name, conn, if_exists="append", index=False)
-    conn.close()
+__all__ = [
+    "get_conn",
+    "save_bet_to_db",
+    "load_bets_from_db",
+    "update_bet_status",
+    "get_bankroll",
+    "update_bankroll",
+    "save_prediction_cache",
+    "get_prediction_cache",
+    "DB_PATH",
+    "get_connection",
+    "init_db",
+    "migrer_anciens_json_vers_sqlite",
+    "charger_historique",
+    "sauvegarder_historique",
+    "charger_courses_jour_db",
+    "sauvegarder_courses_jour_db",
+    "analyser_roi_par_discipline_sql",
+    "analyser_bilan_journalier_sql"
+]

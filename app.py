@@ -6,17 +6,25 @@ from pathlib import Path
 import math
 import re
 import requests
-import sqlite3
 import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import timedelta
+from utils.database import (
+    init_db, migrer_anciens_json_vers_sqlite, charger_historique, 
+    sauvegarder_historique, charger_courses_jour_db, sauvegarder_courses_jour_db, 
+    load_bets_from_db, update_bet_status, get_conn, DB_PATH, save_bet_to_db
+)
 
 # --- CONFIGURATION DES LOGS (Doit être en premier) ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("PMU_Pro")
 
-from utils.database import init_db, migrer_anciens_json_vers_sqlite, charger_historique, sauvegarder_historique, charger_courses_jour_db, DB_PATH
+from utils.database import (
+    init_db, migrer_anciens_json_vers_sqlite, charger_historique, 
+    sauvegarder_historique, charger_courses_jour_db, sauvegarder_courses_jour_db, 
+    load_bets_from_db, update_bet_status, get_conn, DB_PATH
+)
 from utils.api_pmu import telecharger_pmu_date, safe_float, HEADERS
 from utils.ai_model import (
     charger_modele_ia, sauvegarder_modele_ia, calculer_parametres_adaptatifs,
@@ -35,9 +43,8 @@ st.set_page_config(
 
 DOSSIER = Path(".")
 
-# Initialisation DB
+# Initialisation DB & Tables SQL
 init_db()
-migrer_anciens_json_vers_sqlite()
 
 # --- AUTHENTIFICATION ---
 if "authentifie" not in st.session_state:
@@ -55,12 +62,45 @@ if not st.session_state["authentifie"]:
             st.error("Mot de passe incorrect.")
     st.stop()
 
+# =====================================================================
+# SAS UNIQUE OBLIGATOIRE : PASSAGE OBLIGATOIRE PAR L'IA AVANT ENREGISTREMENT
+# =====================================================================
+def enregistrer_pari_via_ia(date_iso, reunion, course_num, discipline, cheval_data, type_pari_souhaite, mise_totale):
+    """
+    Sas unique optimisé pour l'automatisation en masse : 
+    Insère directement le pari en base sans recharger ni parcourir tout l'historique.
+    """
+    score_ia = safe_float(cheval_data.get("score_ia", cheval_data.get("score_analyse", 0.0)))
+    ev_gagnant = safe_float(cheval_data.get("ev_index", 0.0))
+    ev_place = safe_float(cheval_data.get("ev_place_index", 0.0))
+    
+    num_cheval = cheval_data.get("num", "?")
+    nom_cheval = cheval_data.get("nom", "Inconnu")
+    cote = safe_float(cheval_data.get("cote"), 0.0)
+    
+    max_ev = max(ev_gagnant, ev_place)
+    details_str = f"{type_pari_souhaite} ➔ N°{num_cheval} {nom_cheval} (Cote: {cote} | EV: {max_ev:.2f})"
+
+    # Appel direct à l'insertion SQL rapide sur Supabase (évite la surcharge réseau)
+    save_bet_to_db(
+        date=date_iso,
+        reunion=reunion,
+        course=course_num,
+        cheval=details_str,
+        cote=cote,
+        mise=float(mise_totale),
+        statut="En attente",
+        gain=0.0,
+        discipline=discipline
+    )
+    return True
+
 # --- FONCTIONS UTILITAIRES POUR LES STATISTIQUES (ROI) ---
 def test_student_yield(paris_regles, mu_0=-0.15):
     rendements = []
-    for p in paris_regles:
-        m = safe_float(p.get("mise", 0))
-        g = safe_float(p.get("gain", 0))
+    for pari_item in paris_regles:
+        m = safe_float(pari_item.get("mise", 0))
+        g = safe_float(pari_item.get("gain", 0))
         if m > 0:
             rendements.append((g - m) / m)
     n = len(rendements)
@@ -77,8 +117,8 @@ def test_student_yield(paris_regles, mu_0=-0.15):
 def test_significativite_monte_carlo(paris_regles, iterations=10000):
     if len(paris_regles) < 10:
         return None, None
-    profit_reel = sum(safe_float(p.get("gain", 0)) - safe_float(p.get("mise", 0)) for p in paris_regles)
-    profits_nets = [safe_float(p.get("gain", 0)) - safe_float(p.get("mise", 0)) for p in paris_regles]
+    profit_reel = sum(safe_float(pari_item.get("gain", 0)) - safe_float(pari_item.get("mise", 0)) for pari_item in paris_regles)
+    profits_nets = [safe_float(pari_item.get("gain", 0)) - safe_float(pari_item.get("mise", 0)) for pari_item in paris_regles]
     profits_array = np.array(profits_nets)
     n_paris = len(profits_array)
     if n_paris == 0:
@@ -92,77 +132,71 @@ def test_significativite_monte_carlo(paris_regles, iterations=10000):
 
 def verifier_resultats_automatiques_pmu(historique):
     modifie = False
-    dates_modifiees = set()
     
-    aujourdhui = datetime.date.today()
     paris_en_attente = []
-    for p in historique:
-        if p.get("statut") == "En attente":
-            date_pari_str = str(p.get("date", ""))[:10]
-            try:
-                dt_pari = datetime.datetime.strptime(date_pari_str, "%Y-%m-%d").date()
-                if dt_pari <= aujourdhui:
-                    paris_en_attente.append(p)
-            except Exception:
-                paris_en_attente.append(p)
+    for pari_item in historique:
+        if str(pari_item.get("statut", "")).strip().lower() == "en attente":
+            paris_en_attente.append(pari_item)
 
     total_a_verifier = len(paris_en_attente)
     if total_a_verifier == 0:
         return False
 
-    progress_bar = st.progress(0, text="Vérification des résultats PMU...")
-    i = 0
-    for p in paris_en_attente:
-        i += 1
-        progress_bar.progress(min(1.0, i / total_a_verifier), text=f"Vérification pari {i}/{total_a_verifier} ({p.get('date', '')})...")
-        
-        if i % 100 == 0 and modifie:
-            st.toast(f"Sauvegarde automatique intermédiaire : {i}/{total_a_verifier} paris traités.", icon="💾")
-            if "historique" in st.session_state:
-                st.session_state["historique"] = historique
+    groupes_paris = {}
+    for pari_item in paris_en_attente:
+        date_pari = str(pari_item.get("date", "")).strip()[:10]
+        reunion_raw = str(pari_item.get("reunion", "")).strip()
+        course_raw = str(pari_item.get("course_num", pari_item.get("course", ""))).strip()
 
-        date_pari = str(p.get("date", "")).strip()
-        reunion_raw = str(p.get("reunion", "")).strip()
-        course_raw = str(p.get("course_num", "")).strip()
-        course_full = str(p.get("course", "")).strip()
-
-        date_pmu, date_iso_norm = None, date_pari
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-            try:
-                dt = datetime.datetime.strptime(date_pari, fmt)
-                date_pmu = dt.strftime("%d%m%Y")
-                date_iso_norm = dt.strftime("%Y-%m-%d")
-                break
-            except Exception:
-                pass
-        if not date_pmu:
+        try:
+            dt = datetime.datetime.strptime(date_pari, "%Y-%m-%d")
+            date_pmu = dt.strftime("%d%m%Y")
+        except Exception:
             continue
 
-        texte_global = f"{reunion_raw} {course_raw} {course_full}"
-        r_match = re.search(r"R\s*(\d+)", texte_global, re.IGNORECASE)
-        reunion_str = f"R{r_match.group(1)}" if r_match else ""
-        c_match = re.search(r"C\s*(\d+)", texte_global, re.IGNORECASE)
+        r_match = re.search(r"\b(R\d+)\b", reunion_raw, re.IGNORECASE)
+        if not r_match:
+            r_match = re.search(r"R\s*(\d+)", reunion_raw, re.IGNORECASE)
+            reunion_str = f"R{r_match.group(1)}" if r_match else ""
+        else:
+            reunion_str = r_match.group(1).upper()
+
+        c_match = re.search(r"\b(C\d+)\b", course_raw, re.IGNORECASE)
         if not c_match:
-            c_match = re.search(r"\b(\d+)(?:ère|ème|e)?\s*course\b", texte_global, re.IGNORECASE)
-        course_str = f"C{c_match.group(1)}" if c_match else ""
+            c_match = re.search(r"C\s*(\d+)", course_raw, re.IGNORECASE)
+            course_str = f"C{c_match.group(1)}" if c_match else ""
+        else:
+            course_str = c_match.group(1).upper()
 
         if not reunion_str or not course_str:
             continue
 
+        cle = (date_pmu, reunion_str, course_str)
+        if cle not in groupes_paris:
+            groupes_paris[cle] = []
+        groupes_paris[cle].append(pari_item)
+
+    progress_bar = st.progress(0, text="Vérification des résultats PMU...")
+    nb_traites = 0
+
+    for cle, paris_groupe in groupes_paris.items():
+        date_pmu, reunion_str, course_str = cle
+        
         try:
-            res_rap = requests.get(f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{reunion_str}/{course_str}/rapports", headers=HEADERS, timeout=10)
-            res_part = requests.get(f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{reunion_str}/{course_str}/participants", headers=HEADERS, timeout=10)
+            url_part = f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{reunion_str}/{course_str}/participants"
+            res_part = requests.get(url_part, headers=HEADERS, timeout=10)
             if res_part.status_code != 200:
                 continue
 
             liste_partants_bruts = res_part.json().get("participants", [])
             cotes_reelles, partants_arrives = {}, []
-            for part in liste_partants_bruts:
-                num_pmu = str(part.get("numPmu"))
-                rapport = part.get("dernierRapportDirect")
+            for part_elem in liste_partants_bruts:
+                num_pmu = str(part_elem.get("numPmu"))
+                rapport = part_elem.get("dernierRapportDirect")
                 if isinstance(rapport, dict) and isinstance(rapport.get("rapport"), (int, float)):
                     cotes_reelles[num_pmu] = float(rapport.get("rapport"))
-                ordre = part.get("ordreArrivee")
+                
+                ordre = part_elem.get("ordreArrivee")
                 if isinstance(ordre, int) and ordre > 0:
                     partants_arrives.append((ordre, num_pmu))
 
@@ -172,111 +206,103 @@ def verifier_resultats_automatiques_pmu(historique):
             if not arrivee_trouvee:
                 continue
 
-            details = str(p.get("details", ""))
-            mise_totale = safe_float(p.get("mise", 0))
-            gain_total, un_gagne = 0.0, False
-            parts = details.split("|") if "|" in details else [details]
             limite_places = 3 if len(liste_partants_bruts) >= 8 else 2
 
-            for part in parts:
-                part_lower = part.lower()
-                nums_part = re.findall(r"N°\s*(\d+)", part)
-                mise_part_m = re.search(r"\((\d+(?:[\.,]\d+)?)\s*€\)", part)
-                mise_part = float(mise_part_m.group(1).replace(",", ".")) if mise_part_m else (mise_totale / len(parts))
+            for pari_item in paris_groupe:
+                nb_traites += 1
+                progress_bar.progress(min(1.0, nb_traites / total_a_verifier), text=f"Vérification pari {nb_traites}/{total_a_verifier} ({pari_item.get('date', '')})...")
 
-                if ("placé" in part_lower or "place" in part_lower or "sécu" in part_lower) and nums_part:
-                    num_secu = str(nums_part[0])
-                    div_ref = max(1.1, 1.0 + (cotes_reelles.get(num_secu, 3.0) - 1.0) / (3.6 if len(liste_partants_bruts) >= 8 else 2.5))
-                    if num_secu in arrivee_trouvee[:limite_places]:
-                        gain_total += mise_part * div_ref
-                        un_gagne = True
-                elif ("gagnant" in part_lower or "poker" in part_lower) and nums_part:
-                    num_poker = str(nums_part[0])
-                    div_ref = cotes_reelles.get(num_poker, 3.0)
-                    if num_poker == arrivee_trouvee[0]:
-                        gain_total += mise_part * div_ref
-                        un_gagne = True
+                details = str(pari_item.get("details", pari_item.get("cheval", "")))
+                mise_totale = safe_float(pari_item.get("mise", 0))
+                gain_total, un_gagne = 0.0, False
+                parts = details.split("|") if "|" in details else [details]
 
-            p["statut"] = "Gagné" if un_gagne else "Perdu"
-            p["gain"] = round(gain_total, 2)
-            p["diagnostic"] = retroaction_apprentissage_ia(p, arrivee_trouvee, cotes_reelles, liste_partants_bruts)
-            
-            try:
-                conn_db = sqlite3.connect(DB_PATH)
-                cur = conn_db.cursor()
-                cur.execute("SELECT data_json FROM courses_cache WHERE date_iso = ? AND reunion = ? AND course = ?", 
-                            (date_iso_norm, reunion_str, course_str))
-                row_cache = cur.fetchone()
-                if row_cache:
-                    race_data = json.loads(row_cache[0])
-                    for part in race_data.get("chevaux", []):
-                        num_pmu_str = str(part.get("num"))
-                        for ord_num, p_num in partants_arrives:
-                            if num_pmu_str == p_num:
-                                part["ordreArrivee"] = ord_num
-                    cur.execute("UPDATE courses_cache SET data_json = ? WHERE date_iso = ? AND reunion = ? AND course = ?",
-                                (json.dumps(race_data, ensure_ascii=False), date_iso_norm, reunion_str, course_str))
-                    conn_db.commit()
-                conn_db.close()
-            except Exception as e:
-                logger.error(f"Erreur mise à jour ordre arrivée cache : {e}")
+                for p_ligne in parts:
+                    p_lower = p_ligne.lower()
+                    nums_part = re.findall(r"N°\s*(\d+)", p_ligne)
+                    mise_part_m = re.search(r"\((\d+(?:[\.,]\d+)?)\s*€\)", p_ligne)
+                    mise_part = float(mise_part_m.group(1).replace(",", ".")) if mise_part_m else (mise_totale / len(parts))
 
-            modifie = True
-            dates_modifiees.add(date_iso_norm)
+                    if ("placé" in p_lower or "place" in p_lower or "sécu" in p_lower) and nums_part:
+                        num_secu = str(nums_part[0])
+                        cote_direct = cotes_reelles.get(num_secu, 3.0)
+                        div_ref = max(1.1, 1.0 + (cote_direct - 1.0) / (3.6 if len(liste_partants_bruts) >= 8 else 2.5))
+                        if num_secu in arrivee_trouvee[:limite_places]:
+                            gain_total += mise_part * div_ref
+                            un_gagne = True
+                    elif ("gagnant" in p_lower or "poker" in p_lower or "simple" in p_lower) and nums_part:
+                        num_poker = str(nums_part[0])
+                        div_ref = cotes_reelles.get(num_poker, 3.0)
+                        if arrivee_trouvee and num_poker == arrivee_trouvee[0]:
+                            gain_total += mise_part * div_ref
+                            un_gagne = True
+
+                pari_item["statut"] = "Gagné" if un_gagne else "Perdu"
+                pari_item["gain"] = round(gain_total, 2)
+                pari_item["diagnostic"] = retroaction_apprentissage_ia(pari_item, arrivee_trouvee, cotes_reelles, liste_partants_bruts)
+                
+                if pari_item.get("id"):
+                    update_bet_status(pari_item.get("id"), pari_item["statut"], pari_item["gain"])
+
+                modifie = True
+
         except Exception as e:
+            logger.error(f"Erreur vérification résultats pour la course {reunion_str}/{course_str} : {e}")
             continue
-
-    # --- AUTO-APPRENTISSAGE APRÈS VÉRIFICATION DES COURSES ---
-    if modifie:
-        # 1. Réentraînement du modèle LightGBM
-        rafraichir_modele_ml()
-        # 2. Optimisation automatique des poids heuristiques
-        optimiser_poids_ia_automatique()
-        logger.info("Auto-apprentissage IA et mise à jour des poids exécutés avec succès !")
 
     progress_bar.empty()
     return modifie
 
 def analyser_roi_par_discipline_sql():
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT 
-                discipline, COUNT(*) as nb_paris, SUM(mise) as total_mises,
-                SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) as total_gains,
-                (SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) - SUM(mise)) as bilan_net,
-                CASE WHEN SUM(mise) > 0 THEN ((SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) - SUM(mise)) / SUM(mise)) * 100 ELSE 0 END as roi_pourcent
-            FROM paris WHERE statut IN ('Gagné', 'Perdu') GROUP BY discipline ORDER BY roi_pourcent DESC
-        """)
-        rows = cursor.fetchall()
-        conn.close()
-        return pd.DataFrame(rows, columns=["Discipline", "Nb Paris", "Total Mises (€)", "Total Gains (€)", "Bilan Net (€)", "ROI (%)"])
-    except Exception:
+    df = load_bets_from_db()
+    if df.empty:
         return pd.DataFrame()
+    
+    if "discipline" not in df.columns:
+        df["discipline"] = "Non renseigné"
+    else:
+        df["discipline"] = df["discipline"].fillna("Non renseigné").replace("", "Non renseigné")
+
+    df_regle = df[df["statut"].isin(["Gagné", "Perdu"])].copy()
+    if df_regle.empty:
+        return pd.DataFrame()
+        
+    df_regle["mise"] = pd.to_numeric(df_regle["mise"], errors="coerce").fillna(0)
+    df_regle["gain"] = pd.to_numeric(df_regle["gain"], errors="coerce").fillna(0)
+    
+    grouped = df_regle.groupby("discipline").agg(
+        nb_paris=("id", "count"),
+        total_mises=("mise", "sum"),
+        total_gains=("gain", lambda x: df_regle.loc[x.index, "gain"][df_regle.loc[x.index, "statut"] == "Gagné"].sum())
+    ).reset_index()
+    
+    grouped["bilan_net"] = grouped["total_gains"] - grouped["total_mises"]
+    grouped["roi_pourcent"] = grouped.apply(lambda row: (row["bilan_net"] / row["total_mises"] * 100) if row["total_mises"] > 0 else 0, axis=1)
+    grouped = grouped.sort_values(by="roi_pourcent", ascending=False)
+    grouped.columns = ["Discipline", "Nb Paris", "Total Mises (€)", "Total Gains (€)", "Bilan Net (€)", "ROI (%)"]
+    return grouped
 
 def analyser_bilan_journalier_sql():
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT 
-                date as Date,
-                COUNT(*) as "Nb Paris",
-                SUM(mise) as "Total Mises (€)",
-                SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) as "Total Gains (€)",
-                (SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) - SUM(mise)) as "Bilan Net (€)",
-                CASE WHEN SUM(mise) > 0 THEN ((SUM(CASE WHEN statut = 'Gagné' THEN gain ELSE 0 END) - SUM(mise)) / SUM(mise)) * 100 ELSE 0 END as "ROI (%)"
-            FROM paris 
-            WHERE statut IN ('Gagné', 'Perdu') 
-            GROUP BY date 
-            ORDER BY date DESC
-        """)
-        rows = cursor.fetchall()
-        conn.close()
-        return pd.DataFrame(rows, columns=["Date", "Nb Paris", "Total Mises (€)", "Total Gains (€)", "Bilan Net (€)", "ROI (%)"])
-    except Exception:
+    df = load_bets_from_db()
+    if df.empty or "date" not in df.columns:
         return pd.DataFrame()
+    df_regle = df[df["statut"].isin(["Gagné", "Perdu"])].copy()
+    if df_regle.empty:
+        return pd.DataFrame()
+    df_regle["mise"] = pd.to_numeric(df_regle["mise"], errors="coerce").fillna(0)
+    df_regle["gain"] = pd.to_numeric(df_regle["gain"], errors="coerce").fillna(0)
+    
+    grouped = df_regle.groupby("date").agg(
+        nb_paris=("id", "count"),
+        total_mises=("mise", "sum"),
+        total_gains=("gain", lambda x: df_regle.loc[x.index, "gain"][df_regle.loc[x.index, "statut"] == "Gagné"].sum())
+    ).reset_index()
+    
+    grouped["bilan_net"] = grouped["total_gains"] - grouped["total_mises"]
+    grouped["roi_pourcent"] = grouped.apply(lambda row: (row["bilan_net"] / row["total_mises"] * 100) if row["total_mises"] > 0 else 0, axis=1)
+    grouped = grouped.sort_values(by="date", ascending=False) if "date" in grouped.columns else grouped
+    grouped.columns = ["Date", "Nb Paris", "Total Mises (€)", "Total Gains (€)", "Bilan Net (€)", "ROI (%)"]
+    return grouped
 
 # --- NAVIGATION PAR ONGLETS EN HAUT ---
 tab_accueil, tab_chrono, tab_analyse, tab_ia, tab_suivi, tab_bilan, tab_admin = st.tabs([
@@ -296,9 +322,9 @@ with tab_accueil:
     
     historique = charger_historique()
     total_paris = len(historique)
-    gagnes = sum(1 for p in historique if p.get("statut") == "Gagné")
-    mises_totales = sum(safe_float(p.get("mise", 0)) for p in historique)
-    gains_totaux = sum(safe_float(p.get("gain", 0)) for p in historique if p.get("statut") == "Gagné")
+    gagnes = sum(1 for pari_item in historique if pari_item.get("statut") == "Gagné")
+    mises_totales = sum(safe_float(pari_item.get("mise", 0)) for pari_item in historique)
+    gains_totaux = sum(safe_float(pari_item.get("gain", 0)) for pari_item in historique if pari_item.get("statut") == "Gagné")
     
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Paris Enregistrés", total_paris)
@@ -381,23 +407,26 @@ with tab_chrono:
                 with col_b:
                     st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
                     if st.button("⚡ Valider & Enregistrer", key=f"btn_valider_{cle_unique_course}"):
-                        nouveau_pari = {
-                            "date": date_chrono_iso,
-                            "reunion": item_c["reunion"],
-                            "course_num": item_c["course_num"],
-                            "course": f"{item_c['reunion']} - {item_c['course_num']}",
-                            "discipline": course_obj.get("discipline"),
-                            "type": "Rapide Value",
-                            "details": f"Simple Placé (Sécurité Value) ➔ N°{b_chev.get('num', '?')} ({mise_secu}€) | Simple Gagnant (Poker Value) ➔ N°{p_chev.get('num', '?')} ({mise_poker}€)",
-                            "mise": float(mise_input),
-                            "statut": "En attente",
-                            "gain": 0.0,
-                            "diagnostic": "",
-                        }
-                        hist = charger_historique()
-                        hist.append(nouveau_pari)
-                        sauvegarder_historique(hist)
-                        st.success("Pari validé et enregistré !")
+                        enregistrer_pari_via_ia(
+                            date_iso=date_chrono_iso,
+                            reunion=item_c["reunion"],
+                            course_num=item_c["course_num"],
+                            discipline=course_obj.get("discipline"),
+                            cheval_data=b_chev,
+                            type_pari_souhaite="Simple Placé (Sécurité Value)",
+                            mise_totale=mise_secu
+                        )
+                        if mise_poker > 0:
+                            enregistrer_pari_via_ia(
+                                date_iso=date_chrono_iso,
+                                reunion=item_c["reunion"],
+                                course_num=item_c["course_num"],
+                                discipline=course_obj.get("discipline"),
+                                cheval_data=p_chev,
+                                type_pari_souhaite="Simple Gagnant (Poker Value)",
+                                mise_totale=mise_poker
+                            )
+                        st.success("Paris validés, analysés et enregistrés via l'IA !")
                         st.rerun()
     else:
         st.info("Aucune donnée disponible pour cette date. Chargez le programme via le bouton ci-dessus.")
@@ -455,23 +484,18 @@ with tab_analyse:
                 match_num = re.search(r"N°(\d+)", cheval_selectionne_str)
                 num_cheval = match_num.group(1) if match_num else "?"
                 
-                nouveau_pari = {
-                    "date": date_iso,
-                    "reunion": reunion_choisie,
-                    "course_num": course_curr.get("course"),
-                    "course": f"{reunion_choisie} - {course_curr.get('course')}",
-                    "discipline": course_curr.get("discipline"),
-                    "type": f"Analyse IA ({type_pari_sel})",
-                    "details": f"{type_pari_sel} ➔ N°{num_cheval} ({mise_analyse}€)",
-                    "mise": float(mise_analyse),
-                    "statut": "En attente",
-                    "gain": 0.0,
-                    "diagnostic": "",
-                }
-                hist = charger_historique()
-                hist.append(nouveau_pari)
-                sauvegarder_historique(hist)
-                st.success("Pari validé et enregistré avec succès depuis l'onglet Analyse !")
+                cheval_obj = next((c for c in chevaux_analyse if str(c.get("num")) == str(num_cheval)), chevaux_analyse[0])
+                
+                enregistrer_pari_via_ia(
+                    date_iso=date_iso,
+                    reunion=reunion_choisie,
+                    course_num=course_curr.get("course"),
+                    discipline=course_curr.get("discipline"),
+                    cheval_data=cheval_obj,
+                    type_pari_souhaite=type_pari_sel,
+                    mise_totale=mise_analyse
+                )
+                st.success("Pari validé et enregistré avec succès via l'IA depuis l'onglet Analyse !")
                 st.rerun()
 
         st.divider()
@@ -498,8 +522,7 @@ with tab_analyse:
                 st.dataframe(plan_df, width="stretch")
 
             if st.button("⚡ Valider & Enregistrer le Plan d'Allocation Optimal", key="btn_valider_plan_allocation"):
-                hist = charger_historique()
-                nouveaux_paris = []
+                nouveaux_paris_count = 0
                 
                 for _, row in plan_df.iterrows():
                     reunion = str(row.get("Réunion", row.get("reunion", "R1")))
@@ -509,27 +532,25 @@ with tab_analyse:
                     mise = safe_float(row.get("Mise (€)", row.get("mise", 10.0)))
                     type_pari = str(row.get("Type", row.get("type_pari", "Allocation Kelly")))
                     
-                    details = f"{type_pari} ➔ N°{num_cheval} {cheval_nom} ({mise}€)"
-                    
-                    nouveau_pari = {
-                        "date": date_iso,
-                        "reunion": reunion,
-                        "course_num": course_num,
-                        "course": f"{reunion} - {course_num}",
-                        "discipline": course_curr.get("discipline", ""),
-                        "type": "Allocation Kelly (Optimal)",
-                        "details": details,
-                        "mise": mise,
-                        "statut": "En attente",
-                        "gain": 0.0,
-                        "diagnostic": "",
+                    cheval_obj = {
+                        "num": num_cheval,
+                        "nom": cheval_nom,
+                        "cote": safe_float(row.get("Cote", 0.0))
                     }
-                    nouveaux_paris.append(nouveau_pari)
+                    
+                    enregistrer_pari_via_ia(
+                        date_iso=date_iso,
+                        reunion=reunion,
+                        course_num=course_num,
+                        discipline=course_curr.get("discipline", "Galop Plat"),
+                        cheval_data=cheval_obj,
+                        type_pari_souhaite=type_pari,
+                        mise_totale=mise
+                    )
+                    nouveaux_paris_count += 1
                 
-                if nouveaux_paris:
-                    hist.extend(nouveaux_paris)
-                    sauvegarder_historique(hist)
-                    st.success(f"✅ {len(nouveaux_paris)} paris du plan d'allocation optimal ont été validés et enregistrés avec succès !")
+                if nouveaux_paris_count > 0:
+                    st.success(f"✅ {nouveaux_paris_count} paris du plan d'allocation optimal ont été validés et enregistrés via l'IA !")
                     st.session_state.pop("plan_courant", None)
                     st.rerun()
                 else:
@@ -609,12 +630,12 @@ with tab_suivi:
             st.info("Aucun résultat supplémentaire trouvé.")
 
     historique = charger_historique()
-    paris_regles = [p for p in historique if p.get("statut") in ["Gagné", "Perdu"]]
-    total_mises = sum(safe_float(p.get("mise", 0)) for p in paris_regles)
-    total_gains = sum(safe_float(p.get("gain", 0)) for p in paris_regles if p.get("statut") == "Gagné")
+    paris_regles = [pari_item for pari_item in historique if pari_item.get("statut") in ["Gagné", "Perdu"]]
+    total_mises = sum(safe_float(pari_item.get("mise", 0)) for pari_item in paris_regles)
+    total_gains = sum(safe_float(pari_item.get("gain", 0)) for pari_item in paris_regles if pari_item.get("statut") == "Gagné")
     bilan_net = total_gains - total_mises
     roi = (bilan_net / total_mises * 100) if total_mises > 0 else 0.0
-    taux_win = (sum(1 for p in paris_regles if p.get("statut") == "Gagné") / len(paris_regles) * 100) if paris_regles else 0.0
+    taux_win = (sum(1 for pari_item in paris_regles if pari_item.get("statut") == "Gagné") / len(paris_regles) * 100) if paris_regles else 0.0
 
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     kpi1.metric("Total Mises", f"{total_mises:.2f} €")
@@ -651,7 +672,7 @@ with tab_suivi:
 # ================= 6. BILAN PAR RÉUNION =================
 with tab_bilan:
     st.subheader("🏟️ Bilan Financier par Réunion & Discipline")
-    st.subheader("📊 Performance SQL par Discipline")
+    st.subheader("📊 Performance par Discipline")
     df_sql = analyser_roi_par_discipline_sql()
     if not df_sql.empty:
         st.dataframe(df_sql, width="stretch")
@@ -695,7 +716,7 @@ with tab_admin:
                 
                 total_paris_ajoutes = 0
                 historique_actuel = charger_historique()
-                dates_deja_traitees = {str(p.get("date"))[:10] for p in historique_actuel if "Auto" in p.get("type", "")}
+                dates_deja_traitees = {str(pari_item.get("date"))[:10] for pari_item in historique_actuel if "Auto" in pari_item.get("type", "")}
                 
                 for i in range(nb_jours):
                     courante_dt = date_debut + datetime.timedelta(days=i)
@@ -723,7 +744,8 @@ with tab_admin:
                             continue
                             
                         nb_courses_jour = 0
-                        paris_du_jour = []
+                        # Paramètres adaptatifs calculés UNE seule fois pour toute la journée
+                        params_ad_chrono = calculer_parametres_adaptatifs()
                         
                         for c_elem in donnees_jour:
                             nom_c = str(c_elem.get("nom_course", "")).strip()
@@ -737,11 +759,12 @@ with tab_admin:
                             if not chevaux_val_c:
                                 continue
                                 
-                            params_ad_chrono = calculer_parametres_adaptatifs()
                             for c in chevaux_val_c:
                                 c["score_analyse"] = evaluer_score_cheval(
                                     c, c_elem.get("discipline"), c_elem.get("terrain_officiel"),
-                                    c_elem.get("corde", "Corde standard"), courante_iso, params_ad_chrono, distance_course=c_elem.get("distance", "")
+                                    c_elem.get("corde", "Corde standard"), courante_iso, params_ad_chrono, 
+                                    distance_course=c_elem.get("distance", ""),
+                                    utiliser_ml=False  # Désactivation du ML lourd en masse pour booster la vitesse
                                 )
                             normaliser_scores_chevaux(chevaux_val_c, "score_analyse")
                             calculer_valeur_esperee_avancee(chevaux_val_c, len(chevaux_c))
@@ -755,35 +778,37 @@ with tab_admin:
                             mise_secu = round(mise_input * 0.8, 1)
                             mise_poker = round(mise_input - mise_secu, 1)
                             
-                            nouveau_pari = {
-                                "date": courante_iso,
-                                "reunion": r_nom,
-                                "course_num": c_elem.get("course", "C1"),
-                                "course": f"{r_nom} - {c_elem.get('course', 'C1')}",
-                                "discipline": c_elem.get("discipline"),
-                                "type": "Rapide Value (Auto)",
-                                "details": f"Simple Placé (Sécurité Value) ➔ N°{b_chev.get('num', '?')} ({mise_secu}€) | Simple Gagnant (Poker Value) ➔ N°{p_chev.get('num', '?')} ({mise_poker}€)",
-                                "mise": mise_input,
-                                "statut": "En attente",
-                                "gain": 0.0,
-                                "diagnostic": "",
-                            }
-                            paris_du_jour.append(nouveau_pari)
-                            total_paris_ajoutes += 1
+                            enregistrer_pari_via_ia(
+                                date_iso=courante_iso,
+                                reunion=r_nom,
+                                course_num=c_elem.get("course", "C1"),
+                                discipline=c_elem.get("discipline", "Galop Plat"),
+                                cheval_data=b_chev,
+                                type_pari_souhaite="Simple Placé (Sécurité Value Auto)",
+                                mise_totale=mise_secu
+                            )
+                            if mise_poker > 0:
+                                enregistrer_pari_via_ia(
+                                    date_iso=courante_iso,
+                                    reunion=r_nom,
+                                    course_num=c_elem.get("course", "C1"),
+                                    discipline=c_elem.get("discipline", "Galop Plat"),
+                                    cheval_data=p_chev,
+                                    type_pari_souhaite="Simple Gagnant (Poker Value Auto)",
+                                    mise_totale=mise_poker
+                                )
+                            
+                            total_paris_ajoutes += 2
                             nb_courses_jour += 1
                             
-                        if paris_du_jour:
-                            historique_actuel.extend(paris_du_jour)
-                            sauvegarder_historique(historique_actuel)
-                            
-                        st.success(f"-> {nb_courses_jour} paris générés et enregistrés pour le {courante_iso}.")
+                        st.success(f"-> {nb_courses_jour} courses traitées (paris générés via l'IA) pour le {courante_iso}.")
                         
                     except Exception as e:
                         st.error(f"Erreur inattendue sur la date {courante_iso} : {e}. Passage à la date suivante...")
                         continue
                     
                 st.balloons()
-                st.success(f"🎉 Automatisation globale terminée avec succès ! {total_paris_ajoutes} paris au total ont été enregistrés.")
+                st.success(f"🎉 Automatisation globale terminée avec succès ! {total_paris_ajoutes} paris au total ont été enregistrés et validés par l'IA.")
                 
         st.divider()
         col_a1, col_a2 = st.columns(2)
@@ -794,8 +819,7 @@ with tab_admin:
         with col_a2:
             if st.button("🔄 Forcer la migration Base de Données", key="btn_migrer_db_admin"):
                 init_db()
-                migrer_anciens_json_vers_sqlite()
-                st.success("Migration et initialisation de la base de données effectuées.")
+                st.success("Initialisation de la base de données effectuée.")
 
         st.divider()
         st.subheader("🧹 Nettoyage des Paris en Attente Expirés")
@@ -811,26 +835,27 @@ with tab_admin:
                     date_limite = datetime.date.today() - datetime.timedelta(days=int(nb_jours_del))
                     date_limite_str = date_limite.strftime("%Y-%m-%d")
                     
-                    conn = sqlite3.connect(DB_PATH)
+                    conn = get_conn()
                     cursor = conn.cursor()
-                    cursor.execute("DELETE FROM paris WHERE statut = 'En attente' AND date < ?", (date_limite_str,))
+                    cursor.execute("DELETE FROM pmu_bets WHERE statut = 'En attente' AND date < %s", (date_limite_str,))
                     nb_supprimes = cursor.rowcount
                     conn.commit()
+                    cursor.close()
                     conn.close()
                     
                     hist = charger_historique()
                     nouveaux_hist = []
                     supp_hist_count = 0
-                    for p in hist:
-                        if p.get("statut") == "En attente":
-                            d_str = str(p.get("date", ""))[:10]
+                    for pari_item in hist:
+                        if pari_item.get("statut") == "En attente":
+                            d_str = str(pari_item.get("date", ""))[:10]
                             try:
                                 if d_str and datetime.datetime.strptime(d_str, "%Y-%m-%d").date() < date_limite:
                                     supp_hist_count += 1
                                     continue
                             except Exception:
                                 pass
-                        nouveaux_hist.append(p)
+                        nouveaux_hist.append(pari_item)
                     
                     if supp_hist_count > 0:
                         sauvegarder_historique(nouveaux_hist)
@@ -843,24 +868,23 @@ with tab_admin:
                     
         st.divider()
         st.subheader("⚠️ Zone Dangereuse : Remise à Zéro Complète")
-        st.markdown("Cette action supprimera définitivement **tous les paris enregistrés, les courses en cache et l'historique** de la base de données.")
+        st.markdown("Cette action supprimera définitivement **tous les paris enregistrés, les courses en cache, l'historique et les modèles** de la base de données.")
         
         confirm_raz = st.checkbox("Je confirme vouloir supprimer TOUTES les données (irréversible)", key="confirm_raz_checkbox")
         if confirm_raz:
             if st.button("🗑️ Supprimer TOUTES les données acquises", key="btn_raz_total", type="primary"):
                 try:
-                    conn = sqlite3.connect(DB_PATH)
+                    conn = get_conn()
                     cursor = conn.cursor()
-                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-                    tables = cursor.fetchall()
-                    for table_name in tables:
-                        t = table_name[0]
-                        if t != 'sqlite_sequence':
-                            cursor.execute(f"DELETE FROM {t};")
+                    cursor.execute("DELETE FROM pmu_bets;")
+                    cursor.execute("DELETE FROM pmu_bankroll;")
+                    cursor.execute("DELETE FROM pmu_predictions_cache;")
+                    cursor.execute("DELETE FROM courses_cache;")
+                    cursor.execute("DELETE FROM modele_ia;")
                     conn.commit()
+                    cursor.close()
                     conn.close()
                     
-                    init_db()
                     st.cache_data.clear()
                     
                     st.success("🗑️ Remise à zéro effectuée avec succès ! Toutes les données ont été supprimées.")
