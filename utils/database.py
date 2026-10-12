@@ -95,6 +95,33 @@ def save_bet_to_db(date, reunion, course, cheval, cote, mise, statut="En cours",
         except Exception as e:
             st.error(f"Erreur lors de l'enregistrement du pari sur Supabase : {e}")
             return None
+def save_multiple_bets_to_db(liste_paris):
+    """
+    Insère une liste de paris en une seule connexion pour maximiser la vitesse.
+    """
+    with get_db_connection() as conn:
+        try:
+            cur = conn.cursor()
+            query = """
+                INSERT INTO pmu_bets (date, reunion, course, cheval, cote, mise, statut, gain, discipline, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            valeurs = [
+                (
+                    str(p["date"]), str(p["reunion"]), str(p["course"]), str(p["cheval"]),
+                    float(p["cote"]), float(p["mise"]), str(p.get("statut", "En attente")),
+                    float(p.get("gain", 0.0)), str(p.get("discipline", "Non renseigné")),
+                    datetime.utcnow().isoformat()
+                )
+                for p in liste_paris
+            ]
+            cur.executemany(query, valeurs)
+            conn.commit()
+            cur.close()
+            return True
+        except Exception as e:
+            st.error(f"Erreur lors de l'enregistrement groupé des paris sur Supabase : {e}")
+            return False
 
 def load_bets_from_db():
     with get_db_connection() as conn:

@@ -206,7 +206,7 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
     courses_terminees = 0
 
     # Réduit à 5 threads max pour protéger le pool de connexions Supabase
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=15) as executor:
         futures = {executor.submit(_traiter_une_course, *tache): tache for tache in taches_courses}
         
         for future in as_completed(futures):

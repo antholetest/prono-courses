@@ -10,20 +10,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import timedelta
+
+# --- IMPORTATIONS DES MODULES INTERNES (Regroupées et sans doublon) ---
 from utils.database import (
     init_db, migrer_anciens_json_vers_sqlite, charger_historique, 
     sauvegarder_historique, charger_courses_jour_db, sauvegarder_courses_jour_db, 
     load_bets_from_db, update_bet_status, get_conn, DB_PATH, save_bet_to_db
-)
-
-# --- CONFIGURATION DES LOGS (Doit être en premier) ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("PMU_Pro")
-
-from utils.database import (
-    init_db, migrer_anciens_json_vers_sqlite, charger_historique, 
-    sauvegarder_historique, charger_courses_jour_db, sauvegarder_courses_jour_db, 
-    load_bets_from_db, update_bet_status, get_conn, DB_PATH
 )
 from utils.api_pmu import telecharger_pmu_date, safe_float, HEADERS
 from utils.ai_model import (
@@ -32,6 +24,10 @@ from utils.ai_model import (
     generer_plan_budget_journalier, retroaction_apprentissage_ia,
     rafraichir_modele_ml, optimiser_poids_ia_automatique
 )
+
+# --- CONFIGURATION DES LOGS (Doit être en premier) ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("PMU_Pro")
 
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(
@@ -501,6 +497,16 @@ with tab_analyse:
 
         st.info(f"Terrain : {course_curr.get('terrain_officiel')} | Discipline : {course_curr.get('discipline')}")
 
+        st.divider()
+        st.markdown("### ⚙️ Configuration du Pari (Avant Analyse)")
+        col_cfg1, col_cfg2 = st.columns(2)
+        with col_cfg1:
+            type_pari_sel = st.selectbox("Type de pari", ["Simple Gagnant", "Simple Placé", "Value Bet IA"], key="sel_type_pari_analyse")
+        with col_cfg2:
+            mise_analyse = st.number_input("Mise (€)", min_value=1.0, value=10.0, step=1.0, key="mise_analyse_input")
+
+        st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
+
         if st.button("⚡ Lancer l'Analyse Maximisation Gains IA", key="btn_lancer_analyse_ia"):
             params = calculer_parametres_adaptatifs()
             for c in course_curr.get("chevaux", []):
@@ -525,14 +531,10 @@ with tab_analyse:
             st.markdown("### 📝 Enregistrer un pari sur cette course analysée")
             chevaux_analyse = st.session_state["chevaux_analyse_courant"]
             
-            col_v1, col_v2, col_v3 = st.columns([2, 1, 1])
-            with col_v1:
-                options_chevaux = [f"N°{c['num']} - {c['nom']} (Cote: {safe_float(c.get('cote')):.1f})" for c in chevaux_analyse]
-                cheval_selectionne_str = st.selectbox("Sélectionner le cheval", options_chevaux, key="sel_cheval_analyse")
-            with col_v2:
-                type_pari_sel = st.selectbox("Type de pari", ["Simple Gagnant", "Simple Placé", "Value Bet IA"], key="sel_type_pari_analyse")
-            with col_v3:
-                mise_analyse = st.number_input("Mise (€)", min_value=1.0, value=10.0, step=1.0, key="mise_analyse_input")
+            options_chevaux = [f"N°{c['num']} - {c['nom']} (Cote: {safe_float(c.get('cote')):.1f})" for c in chevaux_analyse]
+            cheval_selectionne_str = st.selectbox("Sélectionner le cheval", options_chevaux, key="sel_cheval_analyse")
+            
+            st.info(f"Configuration active : **{type_pari_sel}** | Mise : **{mise_analyse} €**")
                 
             if st.button("⚡ Valider & Enregistrer ce Pari", key="btn_valider_analyse_cours"):
                 match_num = re.search(r"N°(\d+)", cheval_selectionne_str)
@@ -576,7 +578,7 @@ with tab_analyse:
                 st.dataframe(plan_df, width="stretch")
 
             if st.button("⚡ Valider & Enregistrer le Plan d'Allocation Optimal", key="btn_valider_plan_allocation"):
-                nouveaux_paris_count = 0
+                paris_a_inserer = []
                 
                 for _, row in plan_df.iterrows():
                     reunion = str(row.get("Réunion", row.get("reunion", "R1")))
@@ -585,32 +587,30 @@ with tab_analyse:
                     num_cheval = str(row.get("N°", row.get("num", "")))
                     mise = safe_float(row.get("Mise (€)", row.get("mise", 10.0)))
                     type_pari = str(row.get("Type", row.get("type_pari", "Allocation Kelly")))
+                    cote = safe_float(row.get("Cote", 0.0))
                     
-                    cheval_obj = {
-                        "num": num_cheval,
-                        "nom": cheval_nom,
-                        "cote": safe_float(row.get("Cote", 0.0))
-                    }
+                    details_str = f"{type_pari} ➔ N°{num_cheval} {cheval_nom} (Cote: {cote} | EV: {max(safe_float(row.get('EV', 0)), 0):.2f})"
                     
-                    enregistrer_pari_via_ia(
-                        date_iso=date_iso,
-                        reunion=reunion,
-                        course_num=course_num,
-                        discipline=course_curr.get("discipline", "Galop Plat"),
-                        cheval_data=cheval_obj,
-                        type_pari_souhaite=type_pari,
-                        mise_totale=mise
-                    )
-                    nouveaux_paris_count += 1
+                    paris_a_inserer.append({
+                        "date": date_iso,
+                        "reunion": reunion,
+                        "course": course_num,
+                        "cheval": details_str,
+                        "cote": cote,
+                        "mise": mise,
+                        "statut": "En attente",
+                        "gain": 0.0,
+                        "discipline": course_curr.get("discipline", "Galop Plat")
+                    })
                 
-                if nouveaux_paris_count > 0:
-                    st.success(f"✅ {nouveaux_paris_count} paris du plan d'allocation optimal ont été validés et enregistrés via l'IA !")
-                    st.session_state.pop("plan_courant", None)
-                    st.rerun()
+                if paris_a_inserer:
+                    succes = save_multiple_bets_to_db(paris_a_inserer)
+                    if succes:
+                        st.success(f"✅ {len(paris_a_inserer)} paris du plan d'allocation optimal ont été validés et enregistrés instantanément !")
+                        st.session_state.pop("plan_courant", None)
+                        st.rerun()
                 else:
                     st.warning("Aucun pari trouvé dans le plan d'allocation.")
-    else:
-        st.info("Aucune réunion disponible pour cette date.")
 
 # ================= 4. MOTEUR IA & PARAMÈTRES =================
 with tab_ia:
