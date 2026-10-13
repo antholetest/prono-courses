@@ -26,9 +26,11 @@ MODELE_IA_DEFAUT = {
     "poids_hippodrome_acteur": 1.25,
     "poids_distance": 1.10,
     "poids_outsider_cache": 1.30,
+    "poids_duo_entraineur": 1.20,  # Nouveau poids pour le couple Driver/Entraîneur
+    "poids_frecheUR": 1.15,       # Nouveau poids pour la fraîcheur / repos
     "seuil_value_bet": 1.85,
-    "frequence_kelly": 0.05,
-    "disciplines_specifiques": {}, # Stockage des coefficients propres par discipline
+    "frequence_kelly": 0.02,  
+    "disciplines_specifiques": {}, 
     "stats_impact": {
         "victoires_par_ferrage": 0,
         "victoires_par_smart_money": 0,
@@ -48,7 +50,7 @@ def _charger_index_global_memoire():
     if _CACHE_INDEX_GLOBAL is not None:
         return _CACHE_INDEX_GLOBAL
 
-    index_global = {"drivers": {}, "hippodromes": {}, "chevaux": {}}
+    index_global = {"drivers": {}, "entraineurs": {}, "duos": {}, "hippodromes": {}, "chevaux": {}}
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -82,6 +84,7 @@ def _charger_index_global_memoire():
 
                         for part in race.get("chevaux", []):
                             driver = str(part.get("driver", "")).upper().strip()
+                            entraineur = str(part.get("entraineur", "")).upper().strip()
                             ordre = part.get("ordreArrivee", 0)
 
                             if driver and driver != "INCONNU":
@@ -97,6 +100,15 @@ def _charger_index_global_memoire():
                                     index_global["drivers"][driver]["hippodromes"][hipp_race]["total"] += 1
                                     if ordre == 1:
                                         index_global["drivers"][driver]["hippodromes"][hipp_race]["victoires"] += 1
+
+                            if driver and entraineur and driver != "INCONNU" and entraineur != "INCONNU":
+                                duo_key = f"{driver}__{entraineur}"
+                                if duo_key not in index_global["duos"]:
+                                    index_global["duos"][duo_key] = {"total": 0, "victoires": 0}
+                                index_global["duos"][duo_key]["total"] += 1
+                                if ordre == 1:
+                                    index_global["duos"][duo_key]["victoires"] += 1
+
             except Exception:
                 continue
     except Exception as e:
@@ -153,29 +165,60 @@ def calculer_taux_driver_hippodrome_db(nom_driver, hippodrome_cible):
             total_victoires += stats["victoires"]
     return round((total_victoires / total_courses) * 100.0, 2) if total_courses > 0 else 0.0
 
+@st.cache_data(ttl=3600)
+def calculer_taux_duo_driver_entraineur(nom_driver, nom_entraineur):
+    if not nom_driver or not nom_entraineur:
+        return 0.0
+    duo_key = f"{str(nom_driver).upper().strip()}__{str(nom_entraineur).upper().strip()}"
+    index_data = _charger_index_global_memoire()
+    duos = index_data.get("duos", {})
+    if duo_key not in duos:
+        return 0.0
+    stats = duos[duo_key]
+    if stats["total"] < 3:
+        return 0.0
+    return round((stats["victoires"] / stats["total"]) * 100.0, 2)
+
+def evaluer_indice_fraicheur(cheval):
+    """Estime un bonus/malus de fraîcheur basé sur l'historique récent de la musique."""
+    musique = str(cheval.get("musique", "")).upper()
+    if not musique:
+        return 1.0
+    # Si le cheval court de façon très rapprochée (ex: courses consécutives à moins de 10-15 jours)
+    # On détecte s'il y a beaucoup de perquisitions récentes ou un long break (rentrée).
+    tokens = re.findall(r"[1-90DATA]", musique)
+    if len(tokens) >= 2:
+        # S'il vient de courir (premier chiffre à gauche récent), on analyse la configuration
+        premier_token = tokens[0]
+        if premier_token in ["D", "0"] and len(tokens) > 1 and tokens[1] in ["1", "2", "3"]:
+            # Rentrée après échec ou course de prep ferré
+            return 1.15
+    return 1.0
+
 def extraire_caracteristiques_cheval(cheval, discipline, terrain, hippodrome=""):
     score_forme, nb_victoires, nb_podiums, fautes = analyser_forme_musique_avancee(cheval.get("musique", ""))
     taux_driver_hipp = calculer_taux_driver_hippodrome_db(cheval.get("driver", ""), hippodrome)
+    taux_duo = calculer_taux_duo_driver_entraineur(cheval.get("driver", ""), cheval.get("entraineur", ""))
     cote = safe_float(cheval.get("cote"), 10.0)
     poids = safe_float(cheval.get("poids"), 0.0)
     deferre_str = str(cheval.get("deferre", "")).upper()
     is_deferre_4 = 1 if "QUATRE" in deferre_str else 0
     tendance = str(cheval.get("tendance_cote", "stable"))
-    tendance_val = 1.0 if tendance == "baisse_forte" else (-1.0 if tendance == "hausse" else 0.0)
+    tendance_val = 1.0 if "baisse" in tendance else (-1.0 if "hausse" in tendance else 0.0)
     is_trot = 1 if "Trot" in str(discipline) else 0
     is_lourd = 1 if terrain in ["Collant", "Lourd"] else 0
+    fraicheur = evaluer_indice_fraicheur(cheval)
 
     return [
         score_forme, nb_victoires, nb_podiums, fautes,
-        taux_driver_hipp, cote, poids, is_deferre_4,
-        tendance_val, is_trot, is_lourd
+        taux_driver_hipp, taux_duo, cote, poids, is_deferre_4,
+        tendance_val, is_trot, is_lourd, fraicheur
     ]
 
 def _entrainer_modele_ml_depuis_db_impl():
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        # Élargissement de l'échantillon d'entraînement ML à 300 courses pour un historique plus riche
         cursor.execute("""
             SELECT data_json FROM courses_cache 
             ORDER BY date_iso DESC LIMIT 300
@@ -300,7 +343,8 @@ def sauvegarder_modele_ia(modele):
     cles_poids = [
         "poids_musique", "poids_ferrage", "poids_terrain", "poids_poids",
         "poids_cote_tendance", "poids_driver", "poids_corde",
-        "poids_hippodrome_acteur", "poids_distance", "poids_outsider_cache"
+        "poids_hippodrome_acteur", "poids_distance", "poids_outsider_cache",
+        "poids_duo_entraineur", "poids_frecheUR"
     ]
     for cle in cles_poids:
         if cle in modele:
@@ -321,12 +365,10 @@ def optimiser_poids_ia_automatique():
         historique = charger_historique()
         paris_regles = [p for p in historique if str(p.get("statut", "")).strip().lower() in ["gagné", "perdu"]]
         
-        if len(paris_regles) < 5:
-            return False, "Pas assez de paris réglés (Gagné/Perdu) pour lancer l'apprentissage (minimum 5 requis)."
+        if len(paris_regles) < 30:
+            return False, f"Volume insuffisant ({len(paris_regles)}/30 paris réglés requis pour lancer l'apprentissage)."
 
         modele_actuel = charger_modele_ia()
-        
-        # 1. Analyse par discipline pour affinement spécifique
         df_bets = load_bets_from_db()
         disciplines_ajustees = modele_actuel.get("disciplines_specifiques", {})
         
@@ -343,22 +385,20 @@ def optimiser_poids_ia_automatique():
                     
                     if roi_d < -15.0:
                         disciplines_ajustees[disc]["seuil_ajuste"] = min(2.40, disciplines_ajustees[disc]["seuil_ajuste"] + 0.05)
-                        disciplines_ajustees[disc]["multiplicateur_poids"] = min(2.0, disciplines_ajustees[disc]["multiplicateur_poids"] + 0.05)
+                        disciplines_ajustees[disc]["multiplicateur_poids"] = min(1.8, disciplines_ajustees[disc]["multiplicateur_poids"] + 0.05)
                     elif roi_d > 15.0:
                         disciplines_ajustees[disc]["seuil_ajuste"] = max(1.30, disciplines_ajustees[disc]["seuil_ajuste"] - 0.05)
                         disciplines_ajustees[disc]["multiplicateur_poids"] = max(0.8, disciplines_ajustees[disc]["multiplicateur_poids"] - 0.05)
                         
         modele_actuel["disciplines_specifiques"] = disciplines_ajustees
 
-        # 2. Ajustement global standard
         gagnes = [p for p in paris_regles if str(p.get("statut", "")).strip().lower() == "gagné"]
         taux_reussite = len(gagnes) / len(paris_regles)
         seuil_actuel = float(modele_actuel.get("seuil_value_bet", 1.85))
         
         if taux_reussite < 0.25:
             modele_actuel["seuil_value_bet"] = min(2.50, round(seuil_actuel + 0.10, 2))
-            modele_actuel["poids_musique"] = min(2.5, round(float(modele_actuel.get("poids_musique", 1.05)) + 0.05, 2))
-            modele_actuel["poids_ferrage"] = min(2.5, round(float(modele_actuel.get("poids_ferrage", 1.25)) + 0.05, 2))
+            modele_actuel["poids_musique"] = min(1.8, round(float(modele_actuel.get("poids_musique", 1.05)) + 0.05, 2))
             message_bilan = f"Taux global bas ({taux_reussite*100:.1f}%). Ajustements par discipline et filtres renforcés."
         elif taux_reussite > 0.45:
             modele_actuel["seuil_value_bet"] = max(1.30, round(seuil_actuel - 0.05, 2))
@@ -367,13 +407,13 @@ def optimiser_poids_ia_automatique():
             mises_totales = sum(safe_float(p.get("mise", 0)) for p in paris_regles)
             gains_totaux = sum(safe_float(p.get("gain", 0)) for p in gagnes)
             if gains_totaux < mises_totales:
-                modele_actuel["poids_cote_tendance"] = min(2.5, round(float(modele_actuel.get("poids_cote_tendance", 1.35)) + 0.05, 2))
-                message_bilan = "Bilan financier négatif. Importance accrue accordée au Smart Money et aux disciplines."
+                modele_actuel["poids_cote_tendance"] = min(1.8, round(float(modele_actuel.get("poids_cote_tendance", 1.35)) + 0.05, 2))
+                message_bilan = "Bilan financier négatif. Importance accrue accordée au Smart Money."
             else:
                 message_bilan = "Apprentissage multi-disciplinaire stable appliqué."
 
         sauvegarder_modele_ia(modele_actuel)
-        return True, f"Apprentissage terminé ! {message_bilan}"
+        return True, f"Apprentissage par lots terminé ! {message_bilan}"
     except Exception as e:
         return False, f"Erreur apprentissage : {str(e)}"
 
@@ -426,13 +466,13 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_iso, params, d
     modele_ia = charger_modele_ia()
     score = 0.0
 
-    # Application du multiplicateur spécifique par discipline s'il existe
     disc_spec = modele_ia.get("disciplines_specifiques", {}).get(discipline, {})
     mult_discipline = disc_spec.get("multiplicateur_poids", 1.0)
 
     musique = str(cheval.get("musique") or "").upper()
     deferre = str(cheval.get("deferre") or "").upper()
     driver = str(cheval.get("driver") or "").upper()
+    entraineur = str(cheval.get("entraineur") or "").upper()
     cote = safe_float(cheval.get("cote"), 0.0)
     poids = safe_float(cheval.get("poids", 0.0))
     tendance = cheval.get("tendance_cote", "stable")
@@ -472,6 +512,18 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_iso, params, d
         if terrain in ["Collant", "Lourd"] and ("LOURD" in musique or "SOUPLE" in musique):
             score += 7.0 * modele_ia.get("poids_terrain", 1.15) * mult_discipline
 
+    # Ajout du couple Driver / Entraîneur
+    taux_duo = calculer_taux_duo_driver_entraineur(driver, entraineur)
+    if taux_duo > 25.0:
+        score += 8.0 * modele_ia.get("poids_duo_entraineur", 1.20)
+    elif taux_duo > 15.0:
+        score += 4.0 * modele_ia.get("poids_duo_entraineur", 1.20)
+
+    # Ajout de l'indice de fraîcheur
+    fraicheur_val = evaluer_indice_fraicheur(cheval)
+    if fraicheur_val > 1.0:
+        score += 5.0 * modele_ia.get("poids_frecheUR", 1.15)
+
     poids_corde = modele_ia.get("poids_corde", 1.0)
     corde_str = str(corde).upper()
     if "GAUCHE" in corde_str and ("G" in musique or "GAUCHE" in musique):
@@ -481,12 +533,12 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_iso, params, d
     else:
         score += 1.0 * poids_corde
 
-    if tendance == "baisse_tres_forte":
-        score += 10.0 * modele_ia.get("poids_cote_tendance", 1.35)
-    elif tendance == "baisse_forte":
-        score += 6.5 * modele_ia.get("poids_cote_tendance", 1.35)
+    if tendance in ["baisse_tres_forte", "baisse_forte"]:
+        # Smart Money renforcé : si grosse baisse de cote de dernière minute
+        facteur_smart = 12.0 if tendance == "baisse_tres_forte" else 7.5
+        score += facteur_smart * modele_ia.get("poids_cote_tendance", 1.35)
     elif tendance == "hausse":
-        score -= 3.0 * modele_ia.get("poids_cote_tendance", 1.35)
+        score -= 4.0 * modele_ia.get("poids_cote_tendance", 1.35)
 
     mult_acteur = analyser_performances_acteur_par_hippodrome(driver, hippodrome_cible=hippodrome)
     bonus_acteur = (mult_acteur - 1.0) * 10.0
@@ -515,7 +567,9 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_iso, params, d
             bonus_joker += 7.0
         if mult_acteur > 1.2:
             bonus_joker += 6.0
-        score += min(15.0, bonus_joker * poids_outsider)
+        if taux_duo > 20.0:
+            bonus_joker += 5.0
+        score += min(18.0, bonus_joker * poids_outsider)
 
     score += params.get("malus_discipline", {}).get(discipline, 0)
     score_heuristique = max(0.0, round(score, 1))
@@ -558,7 +612,7 @@ def calculer_valeur_esperee_avancee(chevaux_valides, nb_partants=12):
 
     return chevaux_valides
 
-def calculer_fraction_kelly_exacte(p, c, frequence_kelly=0.05):
+def calculer_fraction_kelly_exacte(p, c, frequence_kelly=0.02):
     if c <= 1.0 or p <= 0:
         return 0.0
     kelly = (p * c - 1.0) / (c - 1.0)
@@ -589,15 +643,21 @@ def generer_plan_budget_journalier(date_iso, budget_total=50.0, params_adaptatif
 
     modele_ia = charger_modele_ia()
     disciplines_spec = modele_ia.get("disciplines_specifiques", {})
+    frequence_k = modele_ia.get("frequence_kelly", 0.02)
     
+    opportunites = []
+
     for race in donnees_jour:
         chevaux = race.get("chevaux", [])
         disc = race.get("discipline", "Galop Plat")
-        seuil_ev = disciplines_spec.get(disc, {}).get("seuil_ajuste", modele_ia.get("seuil_value_bet", 1.85))
-        frequence_k = modele_ia.get("frequence_kelly", 0.05)
+        
+        disc_config = disciplines_spec.get(disc, {})
+        seuil_ev = disc_config.get("seuil_ajuste", modele_ia.get("seuil_value_bet", 1.85))
+        proba_min_requise = disc_config.get("proba_min_ajustee", 0.18)
 
         if not chevaux:
             continue
+            
         for c in chevaux:
             c["score_analyse"] = evaluer_score_cheval(
                 c, disc, race.get("terrain_officiel"), 
@@ -607,14 +667,13 @@ def generer_plan_budget_journalier(date_iso, budget_total=50.0, params_adaptatif
         normaliser_scores_chevaux(chevaux, "score_analyse")
         calculer_valeur_esperee_avancee(chevaux, len(chevaux))
 
-        opportunites = []
         for c in chevaux:
             ev_g = safe_float(c.get("ev_index"), 0.0)
             ev_p = safe_float(c.get("ev_place_index"), 0.0)
             est_gagnant = ev_g >= ev_p
             proba_retenue = c.get("proba_estimee") if est_gagnant else c.get("proba_place")
             
-            if (ev_g >= seuil_ev or ev_p >= seuil_ev) and safe_float(proba_retenue, 0.0) >= 0.08:
+            if (ev_g >= seuil_ev or ev_p >= seuil_ev) and safe_float(proba_retenue, 0.0) >= proba_min_requise:
                 opportunites.append({
                     "Réunion": race.get("reunion"),
                     "Course": race.get("course"),
@@ -646,51 +705,24 @@ def retroaction_apprentissage_ia(pari, arrivee_trouvee, cotes_reelles, partants_
     
     modele_ia = charger_modele_ia()
     stats = modele_ia.get("stats_impact", {})
-    stats["total_analyses"] = stats.get("total_analyses", 0) + 1
+    total_analyses = stats.get("total_analyses", 0) + 1
+    stats["total_analyses"] = total_analyses
 
     gain = safe_float(pari.get("gain", 0))
     mise = safe_float(pari.get("mise", 0))
     bilan_pari = gain - mise
     stats["gain_cumule_ia"] = round(stats.get("gain_cumule_ia", 0.0) + bilan_pari, 2)
 
-    # Rétroaction diversifiée sur un plus large panel de variables (ferrage, cote, musique, driver)
-    poids_ferrage = float(modele_ia.get("poids_ferrage", 1.25))
-    poids_cote = float(modele_ia.get("poids_cote_tendance", 1.35))
-    poids_musique = float(modele_ia.get("poids_musique", 1.05))
-    poids_driver = float(modele_ia.get("poids_driver", 1.15))
-    
-    details_pari = str(pari.get("details", pari.get("cheval", ""))).upper()
     statut_pari = str(pari.get("statut", "")).upper()
-    taux_apprentissage = 0.025
+    resultat_reel = 1.0 if ("GAGNÉ" in statut_pari or bilan_pari > 0) else 0.0
 
-    if "GAGNÉ" in statut_pari or bilan_pari > 0:
-        if "FERRÉ" in details_pari or "QUATRE" in details_pari:
-            poids_ferrage += taux_apprentissage
-        if "COTE" in details_pari or "EV" in details_pari:
-            poids_cote += taux_apprentissage
-        if "MUSIQUE" in details_pari or "FORME" in details_pari:
-            poids_musique += taux_apprentissage
-        if "DRIVER" in details_pari:
-            poids_driver += taux_apprentissage
+    if resultat_reel > 0:
         stats["victoires_par_ferrage"] = stats.get("victoires_par_ferrage", 0) + 1
-    elif "PERDU" in statut_pari or bilan_pari < 0:
-        if "FERRÉ" in details_pari:
-            poids_ferrage = max(0.1, poids_ferrage - taux_apprentissage)
-        if "COTE" in details_pari:
-            poids_cote = max(0.1, poids_cote - taux_apprentissage)
-        if "MUSIQUE" in details_pari:
-            poids_musique = max(0.1, poids_musique - taux_apprentissage)
-        if "DRIVER" in details_pari:
-            poids_driver = max(0.1, poids_driver - taux_apprentissage)
 
-    modele_ia["poids_ferrage"] = round(poids_ferrage, 3)
-    modele_ia["poids_cote_tendance"] = round(poids_cote, 3)
-    modele_ia["poids_musique"] = round(poids_musique, 3)
-    modele_ia["poids_driver"] = round(poids_driver, 3)
     modele_ia["stats_impact"] = stats
     sauvegarder_modele_ia(modele_ia)
     
-    return f"Apprentissage diversifié mis à jour | Statut : {statut_pari} (Bilan : {bilan_net_formate(bilan_pari)})"
+    return f"Pari enregistré | Bilan: {bilan_net_formate(bilan_pari)} (Analyse n°{total_analyses} - Apprentissage par lots en attente du volume requis)."
 
 def bilan_net_formate(valeur):
     return f"+{valeur:.2f} €" if valeur >= 0 else f"{valeur:.2f} €"
