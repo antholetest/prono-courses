@@ -26,8 +26,8 @@ MODELE_IA_DEFAUT = {
     "poids_hippodrome_acteur": 1.25,
     "poids_distance": 1.10,
     "poids_outsider_cache": 1.30,
-    "poids_duo_entraineur": 1.20,  # Nouveau poids pour le couple Driver/Entraîneur
-    "poids_frecheUR": 1.15,       # Nouveau poids pour la fraîcheur / repos
+    "poids_duo_entraineur": 1.20,
+    "poids_frecheUR": 1.15,
     "seuil_value_bet": 1.85,
     "frequence_kelly": 0.02,  
     "disciplines_specifiques": {}, 
@@ -180,18 +180,13 @@ def calculer_taux_duo_driver_entraineur(nom_driver, nom_entraineur):
     return round((stats["victoires"] / stats["total"]) * 100.0, 2)
 
 def evaluer_indice_fraicheur(cheval):
-    """Estime un bonus/malus de fraîcheur basé sur l'historique récent de la musique."""
     musique = str(cheval.get("musique", "")).upper()
     if not musique:
         return 1.0
-    # Si le cheval court de façon très rapprochée (ex: courses consécutives à moins de 10-15 jours)
-    # On détecte s'il y a beaucoup de perquisitions récentes ou un long break (rentrée).
     tokens = re.findall(r"[1-90DATA]", musique)
     if len(tokens) >= 2:
-        # S'il vient de courir (premier chiffre à gauche récent), on analyse la configuration
         premier_token = tokens[0]
         if premier_token in ["D", "0"] and len(tokens) > 1 and tokens[1] in ["1", "2", "3"]:
-            # Rentrée après échec ou course de prep ferré
             return 1.15
     return 1.0
 
@@ -386,15 +381,31 @@ def optimiser_poids_ia_automatique():
                     roi_d = ((gains_d - mises_d) / mises_d * 100) if mises_d > 0 else 0
                     
                     if disc not in disciplines_ajustees:
-                        disciplines_ajustees[disc] = {"multiplicateur_poids": 1.0, "seuil_ajuste": 1.85}
+                        disciplines_ajustees[disc] = {
+                            "multiplicateur_poids": 1.0, 
+                            "seuil_ajuste": 1.85,
+                            "bloque_paris": False  # Mode Quarantaine (Shadow Mode) initialisé à False
+                        }
                     
+                    disc_cfg = disciplines_ajustees[disc]
+                    
+                    # --- GESTION AUTOMATIQUE DE LA QUARANTAINE (SHADOW MODE) ---
+                    # Si le ROI de la discipline est très négatif, l'IA bloque les mises réelles
+                    if roi_d < -15.0 and not disc_cfg.get("bloque_paris", False):
+                        disc_cfg["bloque_paris"] = True
+                        logger.info(f"Discipline '{disc}' mise en quarantaine financière (ROI: {roi_d:.1f}%). Analyse en arrière-plan active.")
+                    # Si le ROI remonte au-dessus de -5.0, l'IA lève automatiquement le blocage
+                    elif roi_d > -5.0 and disc_cfg.get("bloque_paris", False):
+                        disc_cfg["bloque_paris"] = False
+                        logger.info(f"Discipline '{disc}' réhabilitée et débloquée (ROI remonté à {roi_d:.1f}%).")
+
                     # Ajustement orienté ROI par discipline
                     if roi_d < -15.0:
-                        disciplines_ajustees[disc]["seuil_ajuste"] = min(2.40, disciplines_ajustees[disc]["seuil_ajuste"] + 0.05)
-                        disciplines_ajustees[disc]["multiplicateur_poids"] = min(1.8, disciplines_ajustees[disc]["multiplicateur_poids"] + 0.05)
+                        disc_cfg["seuil_ajuste"] = min(2.40, disc_cfg["seuil_ajuste"] + 0.05)
+                        disc_cfg["multiplicateur_poids"] = min(1.8, disc_cfg["multiplicateur_poids"] + 0.05)
                     elif roi_d > 15.0:
-                        disciplines_ajustees[disc]["seuil_ajuste"] = max(1.30, disciplines_ajustees[disc]["seuil_ajuste"] - 0.05)
-                        disciplines_ajustees[disc]["multiplicateur_poids"] = max(0.8, disciplines_ajustees[disc]["multiplicateur_poids"] - 0.05)
+                        disc_cfg["seuil_ajuste"] = max(1.30, disc_cfg["seuil_ajuste"] - 0.05)
+                        disc_cfg["multiplicateur_poids"] = max(0.8, disc_cfg["multiplicateur_poids"] - 0.05)
                         
         modele_actuel["disciplines_specifiques"] = disciplines_ajustees
 
@@ -404,15 +415,12 @@ def optimiser_poids_ia_automatique():
         
         # --- BOUCLE D'OPTIMISATION AUTONOME AXÉE ROI ---
         if roi_global < 0.0:
-            # Si le ROI est négatif, l'IA intensifie l'optimisation pour chercher la rentabilité
             cles_poids_flexibles = ["poids_musique", "poids_cote_tendance", "poids_ferrage", "poids_outsider_cache"]
             meilleur_roi_simule = roi_global
             meilleurs_poids_trouves = {}
 
-            # Recherche aléatoire contrôlée de meilleures pondérations pour redresser le ROI
             for _ in range(50):
                 poids_test = {k: round(random.uniform(0.8, 2.2), 2) for k in cles_poids_flexibles}
-                # Simulation d'impact basée sur la tendance des cotes et la musique pour un ROI théorique
                 score_sim = (poids_test.get("poids_cote_tendance", 1.35) * gains_totaux) - (poids_test.get("poids_musique", 1.05) * mises_totales * 0.1)
                 roi_sim = roi_global + (score_sim / max(1.0, mises_totales)) * 5.0
                 
@@ -540,14 +548,12 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_iso, params, d
         if terrain in ["Collant", "Lourd"] and ("LOURD" in musique or "SOUPLE" in musique):
             score += 7.0 * modele_ia.get("poids_terrain", 1.15) * mult_discipline
 
-    # Ajout du couple Driver / Entraîneur
     taux_duo = calculer_taux_duo_driver_entraineur(driver, entraineur)
     if taux_duo > 25.0:
         score += 8.0 * modele_ia.get("poids_duo_entraineur", 1.20)
     elif taux_duo > 15.0:
         score += 4.0 * modele_ia.get("poids_duo_entraineur", 1.20)
 
-    # Ajout de l'indice de fraîcheur
     fraicheur_val = evaluer_indice_fraicheur(cheval)
     if fraicheur_val > 1.0:
         score += 5.0 * modele_ia.get("poids_frecheUR", 1.15)
@@ -562,7 +568,6 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_iso, params, d
         score += 1.0 * poids_corde
 
     if tendance in ["baisse_tres_forte", "baisse_forte"]:
-        # Smart Money renforcé : si grosse baisse de cote de dernière minute
         facteur_smart = 12.0 if tendance == "baisse_tres_forte" else 7.5
         score += facteur_smart * modele_ia.get("poids_cote_tendance", 1.35)
     elif tendance == "hausse":
@@ -676,10 +681,16 @@ def generer_plan_budget_journalier(date_iso, budget_total=50.0, params_adaptatif
     opportunites = []
 
     for race in donnees_jour:
-        chevaux = race.get("chevaux", [])
         disc = race.get("discipline", "Galop Plat")
         
+        # --- VERIFICATION QUARANTAINE (SHADOW MODE) ---
         disc_config = disciplines_spec.get(disc, {})
+        if disc_config.get("bloque_paris", False):
+            # La discipline est en quarantaine financière : l'IA continue d'analyser en arrière-plan (Shadow Mode) 
+            # mais ignore cette course pour l'allocation budgétaire réelle des paris.
+            continue
+
+        chevaux = race.get("chevaux", [])
         seuil_ev = disc_config.get("seuil_ajuste", modele_ia.get("seuil_value_bet", 1.85))
         proba_min_requise = disc_config.get("proba_min_ajustee", 0.18)
 
