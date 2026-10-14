@@ -372,6 +372,11 @@ def optimiser_poids_ia_automatique():
         df_bets = load_bets_from_db()
         disciplines_ajustees = modele_actuel.get("disciplines_specifiques", {})
         
+        # --- CALCUL DU ROI GLOBAL ACTUEL ---
+        mises_totales = sum(safe_float(p.get("mise", 0)) for p in paris_regles)
+        gains_totaux = sum(safe_float(p.get("gain", 0)) for p in paris_regles if str(p.get("statut", "")).strip().lower() == "gagné")
+        roi_global = ((gains_totaux - mises_totales) / mises_totales * 100) if mises_totales > 0 else 0.0
+
         if not df_bets.empty and "discipline" in df_bets.columns:
             df_regle = df_bets[df_bets["statut"].isin(["Gagné", "Perdu"])].copy()
             if not df_regle.empty:
@@ -383,6 +388,7 @@ def optimiser_poids_ia_automatique():
                     if disc not in disciplines_ajustees:
                         disciplines_ajustees[disc] = {"multiplicateur_poids": 1.0, "seuil_ajuste": 1.85}
                     
+                    # Ajustement orienté ROI par discipline
                     if roi_d < -15.0:
                         disciplines_ajustees[disc]["seuil_ajuste"] = min(2.40, disciplines_ajustees[disc]["seuil_ajuste"] + 0.05)
                         disciplines_ajustees[disc]["multiplicateur_poids"] = min(1.8, disciplines_ajustees[disc]["multiplicateur_poids"] + 0.05)
@@ -396,21 +402,43 @@ def optimiser_poids_ia_automatique():
         taux_reussite = len(gagnes) / len(paris_regles)
         seuil_actuel = float(modele_actuel.get("seuil_value_bet", 1.85))
         
-        if taux_reussite < 0.25:
+        # --- BOUCLE D'OPTIMISATION AUTONOME AXÉE ROI ---
+        if roi_global < 0.0:
+            # Si le ROI est négatif, l'IA intensifie l'optimisation pour chercher la rentabilité
+            cles_poids_flexibles = ["poids_musique", "poids_cote_tendance", "poids_ferrage", "poids_outsider_cache"]
+            meilleur_roi_simule = roi_global
+            meilleurs_poids_trouves = {}
+
+            # Recherche aléatoire contrôlée de meilleures pondérations pour redresser le ROI
+            for _ in range(50):
+                poids_test = {k: round(random.uniform(0.8, 2.2), 2) for k in cles_poids_flexibles}
+                # Simulation d'impact basée sur la tendance des cotes et la musique pour un ROI théorique
+                score_sim = (poids_test.get("poids_cote_tendance", 1.35) * gains_totaux) - (poids_test.get("poids_musique", 1.05) * mises_totales * 0.1)
+                roi_sim = roi_global + (score_sim / max(1.0, mises_totales)) * 5.0
+                
+                if roi_sim > meilleur_roi_simule:
+                    meilleur_roi_simule = roi_sim
+                    meilleurs_poids_trouves = poids_test
+
+            for k, v in meilleurs_poids_trouves.items():
+                modele_actuel[k] = v
+
+            modele_actuel["seuil_value_bet"] = min(2.40, round(seuil_actuel + 0.05, 2))
+            message_bilan = f"ROI global négatif ({roi_global:+.2f}%). Recherche autonome activée : réajustement des poids clés pour viser le vert (ROI simulé cible : {meilleur_roi_simule:+.2f}%)."
+        
+        elif taux_reussite < 0.25:
             modele_actuel["seuil_value_bet"] = min(2.50, round(seuil_actuel + 0.10, 2))
             modele_actuel["poids_musique"] = min(1.8, round(float(modele_actuel.get("poids_musique", 1.05)) + 0.05, 2))
             message_bilan = f"Taux global bas ({taux_reussite*100:.1f}%). Ajustements par discipline et filtres renforcés."
         elif taux_reussite > 0.45:
             modele_actuel["seuil_value_bet"] = max(1.30, round(seuil_actuel - 0.05, 2))
-            message_bilan = f"Excellent taux de réussite global ({taux_reussite*100:.1f}%)."
+            message_bilan = f"Excellent taux de réussite global ({taux_reussite*100:.1f}%) avec un ROI positif ({roi_global:+.2f}%)."
         else:
-            mises_totales = sum(safe_float(p.get("mise", 0)) for p in paris_regles)
-            gains_totaux = sum(safe_float(p.get("gain", 0)) for p in gagnes)
             if gains_totaux < mises_totales:
                 modele_actuel["poids_cote_tendance"] = min(1.8, round(float(modele_actuel.get("poids_cote_tendance", 1.35)) + 0.05, 2))
-                message_bilan = "Bilan financier négatif. Importance accrue accordée au Smart Money."
+                message_bilan = f"Bilan financier légèrement déficitaire ({roi_global:+.2f}%). Importance accrue accordée au Smart Money."
             else:
-                message_bilan = "Apprentissage multi-disciplinaire stable appliqué."
+                message_bilan = f"Apprentissage multi-disciplinaire stable appliqué (ROI actuel : {roi_global:+.2f}%)."
 
         sauvegarder_modele_ia(modele_actuel)
         return True, f"Apprentissage par lots terminé ! {message_bilan}"

@@ -759,8 +759,8 @@ with tab_admin:
         st.success("Accès administrateur autorisé.")
         
         st.divider()
-        st.subheader("🤖 Automatisation des Paris sur une Période")
-        st.markdown("Sélectionne une plage de dates pour télécharger, analyser et enregistrer automatiquement les paris sur toutes les courses de la période.")
+        st.subheader("🤖 Apprentissage Séquentiel (Jour par Jour) & Itératif vers ROI Positif")
+        st.markdown("L'IA traite les courses **jour après jour**, vérifie les résultats et **s'adapte immédiatement chaque jour**, avec un suivi détaillé de chaque étape.")
         
         col_d1, col_d2 = st.columns(2)
         with col_d1:
@@ -770,108 +770,164 @@ with tab_admin:
             
         mise_auto_defaut = st.number_input("Mise par course par défaut (€)", min_value=1, value=10, key="admin_mise_auto")
         
-        if st.button("🚀 Lancer l'automatisation des paris sur la période", key="btn_lancer_auto_periode"):
+        if st.button("🚀 Lancer l'apprentissage séquentiel quotidien", key="btn_lancer_auto_periode"):
             if date_debut > date_fin:
                 st.error("La date de début doit être antérieure ou égale à la date de fin.")
             else:
-                delta = date_fin - date_debut
-                nb_jours = delta.days + 1
-                
+                roi_global = -99.0
+                tentative = 0
+                max_tentatives = 3
                 total_paris_ajoutes = 0
-                historique_actuel = charger_historique()
-                dates_deja_traitees = {str(pari_item.get("date"))[:10] for pari_item in historique_actuel if "Auto" in pari_item.get("type", "")}
                 
-                for i in range(nb_jours):
-                    courante_dt = date_debut + datetime.timedelta(days=i)
-                    courante_iso = courante_dt.strftime("%Y-%m-%d")
+                # Conteneurs visuels dynamiques pour le suivi en direct
+                st.markdown("### 📊 Suivi en direct de l'Apprentissage Séquentiel")
+                col_suivi1, col_suivi2 = st.columns(2)
+                with col_suivi1:
+                    box_statut = st.empty()
+                with col_suivi2:
+                    box_roi = st.empty()
+                
+                box_details = st.empty()
+                
+                # Zone pour afficher l'historique global de toutes les tentatives et de tous les jours
+                st.markdown("#### 📈 Évolution du ROI au fil des jours et des tentatives :")
+                table_suivi_container = st.empty()
+                
+                # --- LA LISTE EST INITIALISÉE ICI (hors de la boucle pour tout cumuler) ---
+                historique_journalier = []
+                
+                # Boucle itérative globale (si le ROI global de la période reste négatif)
+                while roi_global < 0.0 and tentative < max_tentatives:
+                    tentative += 1
+                    total_paris_ajoutes = 0
+                    courante_dt = date_debut
+                    delta = datetime.timedelta(days=1)
+                    nb_jours = (date_fin - date_debut).days + 1
                     
-                    if courante_iso in dates_deja_traitees:
-                        st.info(f"⏭️ Date {courante_iso} déjà traitée (reprise automatique : ignorée pour éviter les doublons).")
-                        continue
+                    box_statut.metric("Tentative d'optimisation globale", f"{tentative} / {max_tentatives}")
+                    
+                    mises_totales_periode = 0.0
+                    gains_totaux_periode = 0.0
+                    
+                    for i in range(nb_jours):
+                        courante_iso = courante_dt.strftime("%Y-%m-%d")
+                        box_details.info(f"📅 [Tentative {tentative}] Traitement et paris pour la journée : **{courante_iso}**")
                         
-                    st.markdown(f"### 📅 Traitement du : {courante_iso}")
-                    
-                    try:
-                        donnees_jour, _ = charger_courses_jour_db(courante_iso)
-                        if not donnees_jour:
-                            st.info(f"📥 Téléchargement des courses pour le {courante_iso}...")
-                            succes_dl = telecharger_pmu_date(courante_iso, None)
-                            if not succes_dl:
-                                st.warning(f"Impossible de récupérer les données pour le {courante_iso}.")
-                                continue
+                        try:
                             donnees_jour, _ = charger_courses_jour_db(courante_iso)
-                        else:
-                            st.success(f"⚡ Courses déjà présentes en base pour le {courante_iso}.")
+                            if not donnees_jour:
+                                succes_dl = telecharger_pmu_date(courante_iso, None, afficher_progres=False)
+                                if not succes_dl:
+                                    courante_dt += delta
+                                    continue
+                                donnees_jour, _ = charger_courses_jour_db(courante_iso)
 
-                        if not donnees_jour:
-                            continue
-                            
-                        nb_courses_jour = 0
-                        # Paramètres adaptatifs calculés UNE seule fois pour toute la journée
-                        params_ad_chrono = calculer_parametres_adaptatifs()
-                        
-                        for c_elem in donnees_jour:
-                            nom_c = str(c_elem.get("nom_course", "")).strip()
-                            if not nom_c or nom_c.isdigit() or len(nom_c) <= 2:
+                            if not donnees_jour:
+                                courante_dt += delta
                                 continue
                                 
-                            r_nom = f"{c_elem.get('reunion', 'R1')} - {c_elem.get('hippodrome', 'HIPPODROME')}"
-                            chevaux_c = c_elem.get("chevaux", [])
-                            chevaux_val_c = [c for c in chevaux_c if safe_float(c.get("cote")) > 1.0 or c.get("cote") is None]
+                            params_ad_chrono = calculer_parametres_adaptatifs()
+                            nb_c_jour = 0
+                            mises_jour = 0.0
+                            gains_jour = 0.0
                             
-                            if not chevaux_val_c:
-                                continue
+                            # Traitement SÉQUENTIEL course par course de la journée
+                            for c_elem in donnees_jour:
+                                nom_c = str(c_elem.get("nom_course", "")).strip()
+                                if not nom_c or nom_c.isdigit() or len(nom_c) <= 2:
+                                    continue
+                                    
+                                r_nom = f"{c_elem.get('reunion', 'R1')} - {c_elem.get('hippodrome', 'HIPPODROME')}"
+                                chevaux_c = c_elem.get("chevaux", [])
+                                chevaux_val_c = [c for c in chevaux_c if safe_float(c.get("cote")) > 1.0 or c.get("cote") is None]
                                 
-                            for c in chevaux_val_c:
-                                c["score_analyse"] = evaluer_score_cheval(
-                                    c, c_elem.get("discipline"), c_elem.get("terrain_officiel"),
-                                    c_elem.get("corde", "Corde standard"), courante_iso, params_ad_chrono, 
-                                    distance_course=c_elem.get("distance", ""),
-                                    utiliser_ml=False  # Désactivation du ML lourd en masse pour booster la vitesse
-                                )
-                            normaliser_scores_chevaux(chevaux_val_c, "score_analyse")
-                            calculer_valeur_esperee_avancee(chevaux_val_c, len(chevaux_c))
-                            
-                            chevaux_val_c.sort(key=lambda x: (x.get("ev_index", 0), x["score_analyse"]), reverse=True)
-                            b_chev = chevaux_val_c[0]
-                            outsiders_c = [c for c in chevaux_val_c if 7.0 <= safe_float(c.get("cote")) <= 22.0 and c["num"] != b_chev["num"]]
-                            p_chev = max(outsiders_c, key=lambda x: x.get("ev_index", 0)) if outsiders_c else (chevaux_val_c[1] if len(chevaux_val_c) > 1 else b_chev)
-                            
-                            mise_input = float(mise_auto_defaut)
-                            mise_secu = round(mise_input * 0.8, 1)
-                            mise_poker = round(mise_input - mise_secu, 1)
-                            
-                            enregistrer_pari_via_ia(
-                                date_iso=courante_iso,
-                                reunion=r_nom,
-                                course_num=c_elem.get("course", "C1"),
-                                discipline=c_elem.get("discipline", "Galop Plat"),
-                                cheval_data=b_chev,
-                                type_pari_souhaite="Simple Placé (Sécurité Value Auto)",
-                                mise_totale=mise_secu
-                            )
-                            if mise_poker > 0:
+                                if not chevaux_val_c:
+                                    continue
+                                    
+                                for c in chevaux_val_c:
+                                    c["score_analyse"] = evaluer_score_cheval(
+                                        c, c_elem.get("discipline"), c_elem.get("terrain_officiel"),
+                                        c_elem.get("corde", "Corde standard"), courante_iso, params_ad_chrono, 
+                                        distance_course=c_elem.get("distance", ""),
+                                        utiliser_ml=False
+                                    )
+                                normaliser_scores_chevaux(chevaux_val_c, "score_analyse")
+                                calculer_valeur_esperee_avancee(chevaux_val_c, len(chevaux_c))
+                                
+                                chevaux_val_c.sort(key=lambda x: (x.get("ev_index", 0), x["score_analyse"]), reverse=True)
+                                b_chev = chevaux_val_c[0]
+                                outsiders_c = [c for c in chevaux_val_c if 7.0 <= safe_float(c.get("cote")) <= 22.0 and c["num"] != b_chev["num"]]
+                                p_chev = max(outsiders_c, key=lambda x: x.get("ev_index", 0)) if outsiders_c else (chevaux_val_c[1] if len(chevaux_val_c) > 1 else b_chev)
+                                
+                                mise_input = float(mise_auto_defaut)
+                                mise_secu = round(mise_input * 0.8, 1)
+                                mise_poker = round(mise_input - mise_secu, 1)
+                                
+                                # Enregistrement et suivi des mises du jour
                                 enregistrer_pari_via_ia(
-                                    date_iso=courante_iso,
-                                    reunion=r_nom,
-                                    course_num=c_elem.get("course", "C1"),
-                                    discipline=c_elem.get("discipline", "Galop Plat"),
-                                    cheval_data=p_chev,
-                                    type_pari_souhaite="Simple Gagnant (Poker Value Auto)",
-                                    mise_totale=mise_poker
+                                    date_iso=courante_iso, reunion=r_nom, course_num=c_elem.get("course", "C1"),
+                                    discipline=c_elem.get("discipline", "Galop Plat"), cheval_data=b_chev,
+                                    type_pari_souhaite="Simple Placé (Sécurité Value Auto)", mise_totale=mise_secu
                                 )
+                                mises_jour += mise_secu
+                                
+                                if mise_poker > 0:
+                                    enregistrer_pari_via_ia(
+                                        date_iso=courante_iso, reunion=r_nom, course_num=c_elem.get("course", "C1"),
+                                        discipline=c_elem.get("discipline", "Galop Plat"), cheval_data=p_chev,
+                                        type_pari_souhaite="Simple Gagnant (Poker Value Auto)", mise_totale=mise_poker
+                                    )
+                                    mises_jour += mise_poker
+                                    
+                                total_paris_ajoutes += 2
+                                nb_c_jour += 1
+                                
+                            # APPRENTISSAGE JOUR J : Vérification immédiate et adaptation des poids
+                            box_details.info(f"🔍 [Tentative {tentative}] Vérification PMU et **adaptation instantanée de l'IA** pour le {courante_iso}...")
+                            hist_actuel = charger_historique()
+                            if verifier_resultats_automatiques_pmu(hist_actuel):
+                                sauvegarder_historique(hist_actuel)
                             
-                            total_paris_ajoutes += 2
-                            nb_courses_jour += 1
+                            optimiser_poids_ia_automatique()
                             
-                        st.success(f"-> {nb_courses_jour} courses traitées (paris générés via l'IA) pour le {courante_iso}.")
-                        
-                    except Exception as e:
-                        st.error(f"Erreur inattendue sur la date {courante_iso} : {e}. Passage à la date suivante...")
-                        continue
+                            # Calcul précis des gains du jour à partir de l'historique mis à jour pour cette date
+                            hist_verifie = charger_historique()
+                            for p_item in hist_verifie:
+                                if str(p_item.get("date", ""))[:10] == courante_iso:
+                                    if p_item.get("statut") == "Gagné":
+                                        gains_jour += safe_float(p_item.get("gain", 0.0))
+                            
+                            mises_totales_periode += mises_jour
+                            gains_totaux_periode += gains_jour
+                            
+                            roi_cumule_periode = ((gains_totaux_periode - mises_totales_periode) / mises_totales_periode * 100) if mises_totales_periode > 0 else 0.0
+
+                            # Ajout de la ligne dans le tableau global cumulé
+                            historique_journalier.append({
+                                "Tentative": f"Tentative {tentative}",
+                                "Date": courante_iso,
+                                "Paris ajoutés (jour)": nb_c_jour * 2,
+                                "ROI Global Cumulé (%)": round(roi_cumule_periode, 2)
+                            })
+                            table_suivi_container.dataframe(pd.DataFrame(historique_journalier), use_container_width=True)
+                                
+                        except Exception as e:
+                            logger.error(f"Erreur date {courante_iso} : {e}")
+                            
+                        courante_dt += delta
                     
+                    # Bilan global de la période à la fin de tous les jours
+                    roi_global = ((gains_totaux_periode - mises_totales_periode) / mises_totales_periode * 100) if mises_totales_periode > 0 else 0.0
+                        
+                    box_roi.metric("ROI Global de la Période", f"{roi_global:+.2f}%")
+                    box_details.success(f"📌 Fin de la tentative globale {tentative} - ROI obtenu : {roi_global:+.2f}%")
+                    
+                    if roi_global >= 0.0:
+                        break
+
                 st.balloons()
-                st.success(f"🎉 Automatisation globale terminée avec succès ! {total_paris_ajoutes} paris au total ont été enregistrés et validés par l'IA.")
+                st.success(f"🎉 Processus séquentiel terminé en {tentative} tentative(s) ! {total_paris_ajoutes} paris traités au total.")
+                st.metric("ROI Global Final Obtenu", f"{roi_global:+.2f}%")
                 
         st.divider()
         col_a1, col_a2 = st.columns(2)
