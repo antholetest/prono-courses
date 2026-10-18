@@ -148,6 +148,7 @@ def _traiter_une_course(session, date_pmu, num_r, hippodrome, course):
                     "poids": safe_float(part_item.get("poids", 0.0)),
                     "cote": cote_val,
                     "tendance_cote": tendance,
+                    "ordreArrivee": part_item.get("ordreArrivee"),
                 })
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des partants pour {num_r} {num_c} : {e}")
@@ -205,7 +206,6 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
     progress_bar = st.progress(0, text="Téléchargement des programmes en cours (Multi-thread)...") if afficher_progres else None
     courses_terminees = 0
 
-    # Réduit à 5 threads max pour protéger le pool de connexions Supabase
     with ThreadPoolExecutor(max_workers=15) as executor:
         futures = {executor.submit(_traiter_une_course, *tache): tache for tache in taches_courses}
         

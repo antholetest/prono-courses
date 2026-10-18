@@ -3,8 +3,15 @@ import pandas as pd
 from datetime import datetime
 import json
 import psycopg2
+import re
 from contextlib import contextmanager
-
+def safe_float(val, default=0.0):
+    if val is None or val == "" or val == "-":
+        return default
+    try:
+        return float(str(val).replace(",", ".").replace("€", "").strip())
+    except (ValueError, TypeError):
+        return default
 def get_conn():
     cfg = st.secrets["supabase"]
     return psycopg2.connect(
@@ -29,6 +36,7 @@ def get_db_connection():
 
 DB_PATH = "supabase_cloud"
 
+@st.cache_resource
 def init_db():
     with get_db_connection() as conn:
         try:
@@ -71,6 +79,7 @@ def init_db():
         except Exception as e:
             st.error(f"Erreur initialisation de la base de données Supabase : {e}")
 
+# Compatibilité imports
 def migrer_anciens_json_vers_sqlite(*args, **kwargs):
     pass
 
@@ -95,10 +104,8 @@ def save_bet_to_db(date, reunion, course, cheval, cote, mise, statut="En cours",
         except Exception as e:
             st.error(f"Erreur lors de l'enregistrement du pari sur Supabase : {e}")
             return None
+
 def save_multiple_bets_to_db(liste_paris):
-    """
-    Insère une liste de paris en une seule connexion pour maximiser la vitesse.
-    """
     with get_db_connection() as conn:
         try:
             cur = conn.cursor()
@@ -306,6 +313,22 @@ def sauvegarder_courses_jour_db(date_iso, data):
             st.error(f"Erreur sauvegarde courses sur Supabase : {e}")
             return False
 
+# ==========================================
+# ANALYSES ET RAPPORTS
+# ==========================================
+
+def extraire_cote_depuis_details(row):
+    """Extrait la cote enregistrée dans le champ 'cote' ou dans le texte 'cheval'."""
+    cote_val = row.get("cote", 0.0)
+    if pd.notnull(cote_val) and float(cote_val) > 1.0:
+        return float(cote_val)
+    
+    details = str(row.get("cheval", ""))
+    match = re.search(r"Cote:\s*(\d+(?:[\.,]\d+)?)", details)
+    if match:
+        return float(match.group(1).replace(",", "."))
+    return 0.0
+
 def analyser_roi_par_discipline_sql():
     df = load_bets_from_db()
     if df.empty or "discipline" not in df.columns:
@@ -318,7 +341,16 @@ def analyser_roi_par_discipline_sql():
         
     df_regle["mise"] = pd.to_numeric(df_regle["mise"], errors="coerce").fillna(0.0)
     df_regle["gain"] = pd.to_numeric(df_regle["gain"], errors="coerce").fillna(0.0)
-    
+
+    # Calcul de la moyenne des cotes à partir de vos propres paris enregistrés
+    cotes_moyen_par_discipline = {}
+    for disc, group in df_regle.groupby("discipline"):
+        cotes = group["cote"].apply(safe_float).loc[lambda x: x > 1.0]
+        if not cotes.empty:
+            cotes_moyen_par_discipline[disc] = cotes.mean()
+        else:
+            cotes_moyen_par_discipline[disc] = 0.0
+
     grouped = df_regle.groupby("discipline").agg(
         nb_paris=("id", "count"),
         total_mises=("mise", "sum"),
@@ -327,8 +359,20 @@ def analyser_roi_par_discipline_sql():
     
     grouped["bilan_net"] = grouped["total_gains"] - grouped["total_mises"]
     grouped["roi_pourcent"] = grouped.apply(lambda row: (row["bilan_net"] / row["total_mises"] * 100) if row["total_mises"] > 0 else 0.0, axis=1)
+    
+    # Association de la moyenne des cotes par discipline
+    grouped["moy_cotes_top3"] = grouped["discipline"].map(lambda d: round(cotes_moyen_par_discipline.get(d, 0.0), 2))
+    
     grouped = grouped.sort_values(by="roi_pourcent", ascending=False)
-    grouped.columns = ["Discipline", "Nb Paris", "Total Mises (€)", "Total Gains (€)", "Bilan Net (€)", "ROI (%)"]
+    grouped.columns = [
+        "Discipline", 
+        "Nb Paris", 
+        "Total Mises (€)", 
+        "Total Gains (€)", 
+        "Bilan Net (€)", 
+        "ROI (%)", 
+        "Moy. Cotes Top 3"
+    ]
     return grouped
 
 def analyser_bilan_journalier_sql():
@@ -351,6 +395,6 @@ def analyser_bilan_journalier_sql():
     
     grouped["bilan_net"] = grouped["total_gains"] - grouped["total_mises"]
     grouped["roi_pourcent"] = grouped.apply(lambda row: (row["bilan_net"] / row["total_mises"] * 100) if row["total_mises"] > 0 else 0.0, axis=1)
-    grouped = grouped.sort_values(by="Date" if "Date" in grouped.columns else "date", ascending=False)
+    grouped = grouped.sort_values(by="date", ascending=False)
     grouped.columns = ["Date", "Nb Paris", "Total Mises (€)", "Total Gains (€)", "Bilan Net (€)", "ROI (%)"]
     return grouped
