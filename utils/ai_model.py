@@ -709,7 +709,17 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_iso, params, d
         if poids > 0:
             score += p_poids * 2.0
 
-    mult_acteur = analyser_performances_acteur_par_hippodrome(driver, hippodrome_cible=hippodrome, date_max=date_iso)
+    # --- GESTION EXPERTISE ACTEUR / HIPPODROME FERMÉ ---
+    res_acteur = analyser_performances_acteur_par_hippodrome(driver, hippodrome_cible=hippodrome, date_max=date_iso)
+    if isinstance(res_acteur, tuple):
+        mult_acteur, nb_courses_hipp = res_acteur
+    else:
+        mult_acteur, nb_courses_hipp = res_acteur, 0
+        
+    # Si le driver/jockey connaît très bien l'hippodrome (> 10 courses), on amplifie son bonus de 50%
+    if nb_courses_hipp > 10:
+        mult_acteur = 1.0 + (mult_acteur - 1.0) * 1.5  
+
     score += (mult_acteur - 1.0) * 12.0 * p_driver
 
     if utiliser_ml:
