@@ -821,7 +821,7 @@ with tab_bilan:
     df_sql = analyser_roi_par_discipline_sql()
     if not df_sql.empty:
         # 'use_container_width=True' permet d'afficher proprement toutes les colonnes dynamiques
-        st.dataframe(df_sql, use_container_width=True)
+        st.dataframe(df_sql, width='stretch')
     else:
         st.info("Aucune donnée disponible pour l'analyse par discipline.")
 
@@ -829,7 +829,7 @@ with tab_bilan:
     st.subheader("📅 Bilans Journaliers")
     df_journalier = analyser_bilan_journalier_sql()
     if not df_journalier.empty:
-        st.dataframe(df_journalier, use_container_width=True)
+        st.dataframe(df_journalier, width='stretch')
     else:
         st.info("Aucun pari réglé (Gagné/Perdu) disponible pour afficher le bilan journalier.")
 
@@ -939,7 +939,7 @@ with tab_admin:
                                 "Paris ajoutés (jour)": nb_c_jour,
                                 "ROI Global Cumulé (%)": round(roi_cumule_periode, 2)
                             })
-                            table_suivi_container.dataframe(pd.DataFrame(historique_journalier), use_container_width=True)
+                            table_suivi_container.dataframe(pd.DataFrame(historique_journalier), width='stretch')
                                 
                         except Exception as e:
                             logger.error(f"Erreur date {courante_iso} : {e}")

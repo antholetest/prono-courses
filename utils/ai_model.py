@@ -40,53 +40,53 @@ MODELE_IA_DEFAUT = {
             "poids_ferrage": 1.65,
             "poids_musique": 1.60,
             "poids_driver": 1.60,
-            "multiplicateur_poids": 1.0,
-            "seuil_ev_gagnant": 1.35,
-            "seuil_ev_place": 1.18,
-            "min_cote": 2.20,  # <-- Cote minimale par défaut
-            "max_cote": 8.50,  # <-- Cote maximale par défaut
+            "multiplicateur_poids": 0.90,
+            "seuil_ev_gagnant": 1.55,
+            "seuil_ev_place": 3.00,
+            "min_cote": 2.00,  
+            "max_cote": 8.00,  
             "bloque_paris": False
         },
         "Trot Monté": {
             "poids_ferrage": 1.55,
             "poids_musique": 1.40,
             "poids_driver": 1.45,
-            "multiplicateur_poids": 1.0,
-            "seuil_ev_gagnant": 1.25,
-            "seuil_ev_place": 1.12,
-            "min_cote": 2.00,
-            "max_cote": 10.00,
+            "multiplicateur_poids": 0.90,
+            "seuil_ev_gagnant": 1.45,
+            "seuil_ev_place": 3.00,
+            "min_cote": 2.50,
+            "max_cote": 8.00,
             "bloque_paris": False
         },
         "Galop Plat": {
             "poids_terrain": 1.60,
             "poids_poids": 1.45,
             "poids_corde": 1.40,
-            "multiplicateur_poids": 1.0,
-            "seuil_ev_gagnant": 1.30,
-            "seuil_ev_place": 1.15,
+            "multiplicateur_poids": 0.90,
+            "seuil_ev_gagnant": 1.50,
+            "seuil_ev_place": 3.00,
             "min_cote": 2.50,
-            "max_cote": 9.00,
+            "max_cote": 8.00,
             "bloque_paris": False
         },
         "Haies": {
             "poids_terrain": 1.70,
             "poids_distance": 1.50,
-            "multiplicateur_poids": 1.0,
-            "seuil_ev_gagnant": 1.45,
-            "seuil_ev_place": 1.25,
+            "multiplicateur_poids": 0.85,
+            "seuil_ev_gagnant": 1.60,
+            "seuil_ev_place": 3.00,
             "min_cote": 3.00,
-            "max_cote": 12.00,
+            "max_cote": 10.00,
             "bloque_paris": False
         },
         "Steeple-chase": {
             "poids_terrain": 1.70,
             "poids_distance": 1.50,
-            "multiplicateur_poids": 1.0,
-            "seuil_ev_gagnant": 1.45,
-            "seuil_ev_place": 1.25,
+            "multiplicateur_poids": 0.85,
+            "seuil_ev_gagnant": 1.60,
+            "seuil_ev_place": 3.00,
             "min_cote": 3.00,
-            "max_cote": 12.00,
+            "max_cote": 9.00,
             "bloque_paris": False
         }
     }, 
@@ -347,6 +347,10 @@ def extraire_caracteristiques_cheval(cheval, discipline, terrain, hippodrome="",
     
     is_trot = 1 if "Trot" in str(discipline) else 0
     is_lourd = 1 if terrain in ["Collant", "Lourd"] else 0
+    
+    # ➔ NOUVEAU : Variable croisée (Interaction) pour booster le poids sur terrain lourd
+    affinite_terrain_lourd = round(affinite_terrain * is_lourd, 2)
+    
     fraicheur = evaluer_indice_fraicheur(cheval)
     is_handicap = 1 if "HANDICAP" in str(type_course).upper() else 0
 
@@ -354,7 +358,7 @@ def extraire_caracteristiques_cheval(cheval, discipline, terrain, hippodrome="",
         score_forme, nb_victoires, nb_podiums, fautes,
         taux_driver_hipp, taux_duo, affinite_hipp_cheval, affinite_terrain,
         cote, poids, cart_poids, vitesse_estimee, is_deferre_4, tendance_val, 
-        is_trot, is_lourd, fraicheur, is_handicap
+        is_trot, is_lourd, fraicheur, is_handicap, affinite_terrain_lourd # <--- Ajouté ici
     ]
 
 def _entrainer_modele_ml_depuis_db_impl():
@@ -555,6 +559,12 @@ def optimiser_poids_ia_automatique():
                     roi_d = ((gains_d - mises_d) / mises_d * 100) if mises_d > 0 else 0
             
             if a_des_donnees_reelles:
+                # --- QUARANTAINE AUTOMATIQUE ET RÉACTIVATION INTELLIGENTE ---
+                if roi_d < -15.0:
+                    disc_cfg["bloque_paris"] = True  # Quarantaine automatique si le ROI s'effondre
+                elif roi_d > 3.0 and disc_cfg.get("bloque_paris", False):
+                    disc_cfg["bloque_paris"] = False # Réactivation automatique si la discipline redevient saine
+
                 if roi_d < -5.0:
                     disc_cfg["seuil_ev_gagnant"] = min(1.40, round(disc_cfg.get("seuil_ev_gagnant", 1.18) + 0.02, 2))
                     disc_cfg["seuil_ev_place"] = min(1.25, round(disc_cfg.get("seuil_ev_place", 1.12) + 0.02, 2))
@@ -603,22 +613,25 @@ def analyser_performances_acteur_par_hippodrome(nom_acteur, hippodrome_cible="",
     if not hippodrome_cible and hippodrome:
         hippodrome_cible = hippodrome
     if not nom_acteur:
-        return 1.0
+        return 1.0, 0
     acteur_upper = str(nom_acteur).upper().strip()
     hipp_upper = str(hippodrome_cible).upper().strip()
     index_data = _charger_index_global_memoire(date_max=date_max)
     index_drivers = index_data.get("drivers", {})
     if acteur_upper not in index_drivers:
-        return 1.0
+        return 1.0, 0
+    
     apparitions_globales = index_drivers[acteur_upper]["total"]
     apparitions_hippodrome = 0
     hippos = index_drivers[acteur_upper]["hippodromes"]
     for h_key, stats in hippos.items():
         if hipp_upper in h_key or h_key in hipp_upper:
             apparitions_hippodrome += stats["total"]
+            
     bonus_hipp = min(apparitions_hippodrome * 1.0, 6.0)
     bonus_glob = min(apparitions_globales * 0.2, 3.0)
-    return 1.0 + ((bonus_hipp + bonus_glob) / 10.0)
+    mult = 1.0 + ((bonus_hipp + bonus_glob) / 10.0)
+    return mult, apparitions_hippodrome
 
 def evaluer_score_cheval(cheval, discipline, terrain, corde, date_iso, params, distance_course="", ml_model=None, hippodrome="", utiliser_ml=True):
     modele_ia = charger_modele_ia()
@@ -628,8 +641,7 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_iso, params, d
     disc_spec = disc_configs.get(discipline, {})
     
     mult_discipline = disc_spec.get("multiplicateur_poids", 1.0)
-    if disc_spec.get("bloque_paris", False):
-        return 0.0
+    # L'IA analyse toujours le score même si la discipline est en quarantaine (mode observation)
 
     p_musique = disc_spec.get("poids_musique", modele_ia.get("poids_musique", 1.15))
     p_ferrage = disc_spec.get("poids_ferrage", modele_ia.get("poids_ferrage", 1.30))
@@ -676,14 +688,26 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_iso, params, d
     if taux_duo > 20.0:
         score += 9.0 * modele_ia.get("poids_duo_entraineur", 1.25)
 
-    affinite_cheval = calculer_affinite_cheval_hippodrome(cheval.get("nom", ""), hippodrome, date_max=date_iso)
-    if affinite_cheval > 1.1:
-        score += 8.0 * mult_discipline
+    # --- GESTION AFFINITÉ TERRAIN DYNAMIQUE ---
+    affinite_t = calculer_affinite_terrain(cheval.get("nom", ""), terrain, date_max=date_iso)
+    
+    if "Trot" not in str(discipline):
+        if terrain in ["Collant", "Lourd"]:
+            # ➔ Si le terrain est lourd, on amplifie massivement l'impact de l'affinité terrain (facteur x3)
+            if affinite_t > 1.1:
+                score += (affinite_t - 1.0) * 25.0 * p_terrain * mult_discipline
+            elif affinite_t < 0.9:
+                score -= 15.0 * p_terrain * mult_discipline
+                
+            # Vérification textuelle de secours dans la musique si l'historique est vide
+            if "LOURD" in musique or "SOUPLE" in musique:
+                score += 12.0 * p_terrain * mult_discipline
+        else:
+            # Comportement standard sur terrain bon
+            score += (affinite_t - 1.0) * 8.0 * p_terrain * mult_discipline
 
-    if tendance in ["baisse_tres_forte", "baisse_forte"]:
-        score += 14.0 * p_tendance
-    elif tendance == "hausse":
-        score -= 6.0
+        if poids > 0:
+            score += p_poids * 2.0
 
     mult_acteur = analyser_performances_acteur_par_hippodrome(driver, hippodrome_cible=hippodrome, date_max=date_iso)
     score += (mult_acteur - 1.0) * 12.0 * p_driver
@@ -717,7 +741,13 @@ def calculer_valeur_esperee_avancee(chevaux_valides, nb_partants=12):
         proba_place = min(0.70, proba_estimee * 2.2 + (1.0 / nb_partants))
         c["proba_place"] = round(proba_place, 4)
         
-        cote_place = max(1.05, 1.0 + (cote - 1.0) / 3.8)
+        # UTILISATION DE LA VRAIE COTE SI DISPONIBLE, SINON FORMULE STRICTE (diviseur 5.0 au lieu de 3.8)
+        cote_place_reelle = c.get("cote_place_reelle")
+        if cote_place_reelle and cote_place_reelle > 1.0:
+            cote_place = cote_place_reelle
+        else:
+            cote_place = max(1.05, 1.0 + (cote - 1.0) / 5.0)
+
         c["cote_place_estimee"] = round(cote_place, 2)
         c["ev_place_index"] = round(proba_place * cote_place, 2) if cote > 1.0 else 0.0
 
@@ -771,7 +801,7 @@ def generer_plan_budget_journalier(date_iso, budget_total=50.0, params_adaptatif
         disc = race.get("discipline", "Galop Plat")
         disc_config = disciplines_spec.get(disc, {})
         if disc_config.get("bloque_paris", False):
-            continue
+            continue # Bloque uniquement l'allocation du budget
 
         if not chevaux:
             continue
@@ -925,8 +955,7 @@ def simuler_et_entrainer_journee_intelligente(date_iso, mise_defaut=10.0):
         discipline_course = c_elem.get("discipline", "Galop Plat")
         
         config_discipline = disc_spec_map.get(discipline_course, {})
-        if config_discipline.get("bloque_paris", False):
-            continue
+        est_bloque = config_discipline.get("bloque_paris", False)
 
         seuil_ev_g = float(config_discipline.get("seuil_ev_gagnant", modele_ia.get("seuil_value_gagnant", 1.15)))
         seuil_ev_p = float(config_discipline.get("seuil_ev_place", modele_ia.get("seuil_value_place", 1.10)))
@@ -964,7 +993,11 @@ def simuler_et_entrainer_journee_intelligente(date_iso, mise_defaut=10.0):
                 discipline=discipline_course
             )
 
-        # NOUVEAU CODE DYNAMIQUE :
+        # Si la discipline est bloquée, l'IA continue d'analyser (mode observation) mais ne pose pas de mise réelle
+        if est_bloque:
+            continue
+
+        # --- GESTION DU MODE OBSERVATION OU PARI RÉEL ---
         min_c = float(config_discipline.get("min_cote", 2.20))
         max_c = float(config_discipline.get("max_cote", 8.50))
 
@@ -984,7 +1017,18 @@ def simuler_et_entrainer_journee_intelligente(date_iso, mise_defaut=10.0):
             nom_b = b_chev.get("nom", "Inconnu")
             cote_b = safe_float(b_chev.get("cote"), 0.0)
             ev_b = safe_float(b_chev.get("ev_place_index", 0))
-            details_reel = f"Simple Placé ({discipline_course} Value Auto) ➔ N°{num_b} {nom_b} (Cote: {cote_b} | EV Placé: {ev_b:.2f})"
+
+            if est_bloque:
+                # ➔ MODE OBSERVATION : La discipline est en quarantaine, on enregistre un pari VIRTUEL (mise = 0.0 €) 
+                # pour que l'IA continue d'apprendre et de tester si elle redevient rentable sans risquer d'argent.
+                details_reel = f"Observation Virtuelle ({discipline_course}) ➔ N°{num_b} {nom_b} (Cote: {cote_b} | EV Placé: {ev_b:.2f})"
+                mise_effective = 0.0
+            else:
+                # ➔ MODE ACTIF : La discipline est saine, on place le pari réel avec la mise par défaut.
+                details_reel = f"Simple Placé ({discipline_course} Value Auto) ➔ N°{num_b} {nom_b} (Cote: {cote_b} | EV Placé: {ev_b:.2f})"
+                mise_effective = float(mise_defaut)
+                nb_paris_ajoutes += 1
+                mises_jour += mise_effective
 
             save_bet_to_db(
                 date=date_iso,
@@ -992,7 +1036,7 @@ def simuler_et_entrainer_journee_intelligente(date_iso, mise_defaut=10.0):
                 course=c_elem.get("course", "C1"),
                 cheval=details_reel,
                 cote=cote_b,
-                mise=float(mise_defaut),
+                mise=mise_effective,
                 statut="En attente",
                 gain=0.0,
                 discipline=discipline_course

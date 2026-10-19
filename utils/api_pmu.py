@@ -117,13 +117,25 @@ def _traiter_une_course(session, date_pmu, num_r, hippodrome, course):
     try:
         res_part = session.get(url_partants, timeout=10)
         if res_part.status_code == 200:
-            for part_item in res_part.json().get("participants", []):
+            data_partants = res_part.json()
+            # Certains flux PMU listent les rapports par type de pari dans une liste globale ou par participant
+            for part_item in data_partants.get("participants", []):
                 rapport_direct = part_item.get("dernierRapportDirect")
                 cote_val = (
                     rapport_direct.get("rapport")
                     if isinstance(rapport_direct, dict)
                     else None
                 )
+
+                # Recherche d'un rapport placé explicite s'il est présent dans l'objet du participant
+                cote_place_val = None
+                # Si le PMU fournit un tableau de rapports par type de pari pour le participant
+                les_rapports = part_item.get("rapports", [])
+                if isinstance(les_rapports, list):
+                    for rap in les_rapports:
+                        if str(rap.get("typePari", "")).upper() in ["SIMPLE_PLACE", "PLACE"]:
+                            cote_place_val = safe_float(rap.get("rapport", 0))
+                            break
 
                 rapport_ref = part_item.get("rapportReference")
                 cote_ouv = (
@@ -147,6 +159,7 @@ def _traiter_une_course(session, date_pmu, num_r, hippodrome, course):
                     "deferre": part_item.get("deferre", ""),
                     "poids": safe_float(part_item.get("poids", 0.0)),
                     "cote": cote_val,
+                    "cote_place_reelle": cote_place_val, # Stocke le vrai rapport placé s'il existe
                     "tendance_cote": tendance,
                     "ordreArrivee": part_item.get("ordreArrivee"),
                 })

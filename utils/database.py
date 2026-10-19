@@ -331,37 +331,85 @@ def extraire_cote_depuis_details(row):
 
 def analyser_roi_par_discipline_sql():
     df = load_bets_from_db()
+    
+    # 1. Calcul des cotes moyennes réelles du Top 3 (Podium) depuis courses_cache
+    cotes_podium_par_discipline = {}
+    total_podiums_disc = {}
+    
+    with get_db_connection() as conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT data_json FROM courses_cache")
+            rows = cur.fetchall()
+            cur.close()
+            
+            for row in rows:
+                val_json = row[0] if isinstance(row, (list, tuple)) else row.get("data_json")
+                try:
+                    races = json.loads(val_json)
+                    if isinstance(races, dict):
+                        races = [races]
+                    if isinstance(races, list):
+                        for race in races:
+                            disc = str(race.get("discipline", "Non renseigné")).strip()
+                            chevaux = race.get("chevaux", [])
+                            for part in chevaux:
+                                ordre = part.get("ordreArrivee")
+                                # On cible les chevaux arrivés 1er, 2e ou 3e
+                                if isinstance(ordre, int) and 1 <= ordre <= 3:
+                                    cote_cheval = safe_float(part.get("cote", 0.0))
+                                    if cote_cheval > 1.0:
+                                        if disc not in cotes_podium_par_discipline:
+                                            cotes_podium_par_discipline[disc] = 0.0
+                                            total_podiums_disc[disc] = 0
+                                        cotes_podium_par_discipline[disc] += cote_cheval
+                                        total_podiums_disc[disc] += 1
+                except Exception:
+                    continue
+        except Exception as e:
+            st.error(f"Erreur lecture cache courses pour le top 3 : {e}")
+
+    # Moyenne des cotes du podium par discipline
+    moy_cotes_podium = {}
+    for disc, somme in cotes_podium_par_discipline.items():
+        nb = total_podiums_disc.get(disc, 1)
+        moy_cotes_podium[disc] = round(somme / nb, 2) if nb > 0 else 0.0
+
     if df.empty or "discipline" not in df.columns:
-        return pd.DataFrame()
+        # Si pas de paris mais qu'on a le cache des courses, on retourne quand même le profil des cotes podiums
+        data_fallback = []
+        for disc, moy in moy_cotes_podium.items():
+            data_fallback.append({
+                "Discipline": disc, "Nb Paris": 0, "Total Mises (€)": 0.0, 
+                "Total Gains (€)": 0.0, "Bilan Net (€)": 0.0, "ROI (%)": 0.0, 
+                "Moy. Cotes Réelles Top 3": moy
+            })
+        return pd.DataFrame(data_fallback)
     
     df["discipline"] = df["discipline"].fillna("Non renseigné").replace("", "Non renseigné")
     df_regle = df[df["statut"].isin(["Gagné", "Perdu"])].copy()
+    
     if df_regle.empty:
-        return pd.DataFrame()
-        
-    df_regle["mise"] = pd.to_numeric(df_regle["mise"], errors="coerce").fillna(0.0)
-    df_regle["gain"] = pd.to_numeric(df_regle["gain"], errors="coerce").fillna(0.0)
+        grouped = df.groupby("discipline").agg(
+            nb_paris=("id", "count"),
+            total_mises=("mise", lambda x: 0.0),
+            total_gains=("gain", lambda x: 0.0)
+        ).reset_index()
+    else:
+        df_regle["mise"] = pd.to_numeric(df_regle["mise"], errors="coerce").fillna(0.0)
+        df_regle["gain"] = pd.to_numeric(df_regle["gain"], errors="coerce").fillna(0.0)
 
-    # Calcul de la moyenne des cotes à partir de vos propres paris enregistrés
-    cotes_moyen_par_discipline = {}
-    for disc, group in df_regle.groupby("discipline"):
-        cotes = group["cote"].apply(safe_float).loc[lambda x: x > 1.0]
-        if not cotes.empty:
-            cotes_moyen_par_discipline[disc] = cotes.mean()
-        else:
-            cotes_moyen_par_discipline[disc] = 0.0
-
-    grouped = df_regle.groupby("discipline").agg(
-        nb_paris=("id", "count"),
-        total_mises=("mise", "sum"),
-        total_gains=("gain", lambda x: df_regle.loc[x.index, "gain"][df_regle.loc[x.index, "statut"] == "Gagné"].sum())
-    ).reset_index()
+        grouped = df_regle.groupby("discipline").agg(
+            nb_paris=("id", "count"),
+            total_mises=("mise", "sum"),
+            total_gains=("gain", lambda x: df_regle.loc[x.index, "gain"][df_regle.loc[x.index, "statut"] == "Gagné"].sum())
+        ).reset_index()
     
     grouped["bilan_net"] = grouped["total_gains"] - grouped["total_mises"]
     grouped["roi_pourcent"] = grouped.apply(lambda row: (row["bilan_net"] / row["total_mises"] * 100) if row["total_mises"] > 0 else 0.0, axis=1)
     
-    # Association de la moyenne des cotes par discipline
-    grouped["moy_cotes_top3"] = grouped["discipline"].map(lambda d: round(cotes_moyen_par_discipline.get(d, 0.0), 2))
+    # Association de la vraie moyenne des cotes du top 3 réel par discipline
+    grouped["Moy. Cotes Réelles Top 3"] = grouped["discipline"].map(lambda d: moy_cotes_podium.get(d, 0.0))
     
     grouped = grouped.sort_values(by="roi_pourcent", ascending=False)
     grouped.columns = [
@@ -371,7 +419,7 @@ def analyser_roi_par_discipline_sql():
         "Total Gains (€)", 
         "Bilan Net (€)", 
         "ROI (%)", 
-        "Moy. Cotes Top 3"
+        "Moy. Cotes Réelles Top 3"
     ]
     return grouped
 
