@@ -4,6 +4,7 @@ import logging
 import math
 import re
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -552,19 +553,17 @@ with tab_chrono:
         if donnees_chrono:
             toutes_courses = []
 
-            for c_elem in donnees_chrono:
-                if not isinstance(c_elem, dict):
-                    continue
-
+            # Fonction interne pour traiter une course en parallèle et accélérer l'analyse
+            def _traiter_course_chrono(c_elem):
                 nom_c = str(c_elem.get("nom_course", "")).strip()
                 if not nom_c or nom_c.isdigit() or len(nom_c) <= 2:
-                    continue
+                    return None
 
                 r_nom = f"{c_elem.get('reunion', 'R1')} - {c_elem.get('hippodrome', 'HIPPODROME')}"
                 chevaux_c = c_elem.get("chevaux", [])
 
                 if not chevaux_c:
-                    continue
+                    return None
 
                 modele = cached_charger_modele_ia()
                 disc_cfg = modele.get("disciplines_specifiques", {}).get(c_elem.get("discipline", ""), {})
@@ -625,18 +624,24 @@ with tab_chrono:
                             else (candidats_valides[1] if len(candidats_valides) > 1 else base_chev)
                         )
 
-                        toutes_courses.append(
-                            {
-                                "heure": c_elem.get("heure", "13:30"),
-                                "reunion": r_nom,
-                                "course_num": c_elem.get("course", "C1"),
-                                "nom_course": nom_c,
-                                "discipline": c_elem.get("discipline", ""),
-                                "data": c_elem,
-                                "base": base_chev,
-                                "poker": poker_chev,
-                            }
-                        )
+                        return {
+                            "heure": c_elem.get("heure", "13:30"),
+                            "reunion": r_nom,
+                            "course_num": c_elem.get("course", "C1"),
+                            "nom_course": nom_c,
+                            "discipline": c_elem.get("discipline", ""),
+                            "data": c_elem,
+                            "base": base_chev,
+                            "poker": poker_chev,
+                        }
+                return None
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(_traiter_course_chrono, c) for c in donnees_chrono]
+                for future in as_completed(futures):
+                    res = future.result()
+                    if res:
+                        toutes_courses.append(res)
 
             toutes_courses.sort(key=lambda x: x["heure"])
 

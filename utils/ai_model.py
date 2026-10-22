@@ -4,6 +4,7 @@ import logging
 import math
 import pickle
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -906,7 +907,7 @@ def analyser_performances_acteur_par_hippodrome(nom_acteur, hippodrome_cible="",
 
 
 # ============================================================
-# SCORE IA CHEVAL
+# SCORE IA CHEVAL & EVALUATION PARALLÈLE
 # ============================================================
 def evaluer_score_cheval(cheval, discipline, terrain, corde, date_iso, params, distance_course="", ml_model=None, hippodrome="", utiliser_ml=True, modele_ia=None):
     if modele_ia is None:
@@ -997,6 +998,48 @@ def evaluer_score_cheval(cheval, discipline, terrain, corde, date_iso, params, d
             score += proba_ml * 50.0 * p_tendance
 
     return max(0.0, round(score, 1))
+
+
+def evaluer_scores_et_ev_parallele(donnees_jour, date_iso, params_ad, modele_ia=None):
+    """
+    Nouvelle fonction d'évaluation multi-threadée : évalue les scores et EV
+    de toutes les courses de la journée en parallèle pour un gain de temps maximal.
+    """
+    if not donnees_jour:
+        return donnees_jour
+
+    if modele_ia is None:
+        modele_ia = charger_modele_ia()
+
+    def _traiter_une_course_seule(c_elem):
+        chevaux = c_elem.get("chevaux", [])
+        if not chevaux:
+            return c_elem
+
+        discipline_course = c_elem.get("discipline", "Galop Plat")
+        for c in chevaux:
+            c["score_analyse"] = evaluer_score_cheval(
+                c,
+                discipline_course,
+                c_elem.get("terrain_officiel"),
+                c_elem.get("corde", "Corde standard"),
+                date_iso,
+                params_ad,
+                distance_course=c_elem.get("distance", ""),
+                hippodrome=c_elem.get("hippodrome", ""),
+                utiliser_ml=True,
+                modele_ia=modele_ia,
+            )
+
+        normaliser_scores_chevaux(chevaux, "score_analyse")
+        calculer_valeur_esperee_avancee(chevaux, len(chevaux))
+        return c_elem
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_traiter_une_course_seule, race) for race in donnees_jour]
+        resultats = [f.result() for f in as_completed(futures)]
+
+    return resultats
 
 
 def calculer_valeur_esperee_avancee(chevaux_valides, nb_partants=12):
@@ -1254,6 +1297,9 @@ def simuler_et_entrainer_journee_intelligente(date_iso, mise_defaut=10.0):
     nb_paris_ajoutes = 0
     mises_jour = 0.0
 
+    # Utilisation du traitement parallèle pour calculer les scores sur toutes les courses d'un coup
+    donnees_jour = evaluer_scores_et_ev_parallele(donnees_jour, date_iso, params_ad, modele_ia)
+
     for c_elem in donnees_jour:
         nom_c = str(c_elem.get("nom_course", "")).strip()
         if not nom_c or nom_c.isdigit() or len(nom_c) <= 2:
@@ -1264,28 +1310,11 @@ def simuler_et_entrainer_journee_intelligente(date_iso, mise_defaut=10.0):
 
         config_discipline = disc_spec_map.get(discipline_course, {})
         est_bloque = config_discipline.get("bloque_paris", False)
-        seuil_ev_g = float(config_discipline.get("seuil_ev_gagnant", modele_ia.get("seuil_value_gagnant", 1.10)))
         seuil_ev_p = float(config_discipline.get("seuil_ev_place", modele_ia.get("seuil_value_place", 1.20)))
 
         chevaux_c = c_elem.get("chevaux", [])
         if not chevaux_c:
             continue
-
-        for c in chevaux_c:
-            c["score_analyse"] = evaluer_score_cheval(
-                c,
-                discipline_course,
-                c_elem.get("terrain_officiel"),
-                c_elem.get("corde", "Corde standard"),
-                date_iso,
-                params_ad,
-                distance_course=c_elem.get("distance", ""),
-                utiliser_ml=True,
-                modele_ia=modele_ia,
-            )
-
-        normaliser_scores_chevaux(chevaux_c, "score_analyse")
-        calculer_valeur_esperee_avancee(chevaux_c, len(chevaux_c))
 
         meilleur_sim = max(chevaux_c, key=lambda x: safe_float(x.get("ev_index", 0)), default=None)
         if meilleur_sim:
