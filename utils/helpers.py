@@ -7,3 +7,6 @@ def safe_float(val, default=0.0):
         return float(str(val).replace(",", ".").replace("€", "").strip())
     except (ValueError, TypeError):
         return default
+
+
+__all__ = ["safe_float"]

@@ -1,20 +1,25 @@
 import datetime
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from zoneinfo import ZoneInfo
+
 import requests
 import streamlit as st
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
-from utils.database import DB_PATH, sauvegarder_courses_jour_db
+
+from utils.database import sauvegarder_courses_jour_db
 from utils.helpers import safe_float
 
 logger = logging.getLogger("PMU_Pro")
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36"
     )
 }
+
 
 def creer_session_avec_retry():
     session = requests.Session()
@@ -22,13 +27,14 @@ def creer_session_avec_retry():
         total=3,
         backoff_factor=0.5,
         status_forcelist=[500, 502, 503, 504],
-        raise_on_status=False
+        raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update(HEADERS)
     return session
+
 
 def detecter_discipline(course_obj):
     api_disc = str(course_obj.get("discipline", "")).upper()
@@ -39,7 +45,7 @@ def detecter_discipline(course_obj):
         return "Trot Attelé"
     elif "MONTE" in combined or "TROT_MONTE" in combined:
         return "Trot Monté"
-    elif "HAIES" in combined:
+    elif "HAIE" in combined:
         return "Haies"
     elif "STEEPLE" in combined:
         return "Steeple-chase"
@@ -59,6 +65,7 @@ def detecter_discipline(course_obj):
         return "Trot Attelé"
     return "Galop Plat"
 
+
 def detecter_corde(nom_course, conditions_texte=""):
     texte = f"{nom_course} {conditions_texte}".upper()
     if "GAUCHE" in texte:
@@ -66,6 +73,7 @@ def detecter_corde(nom_course, conditions_texte=""):
     elif "DROITE" in texte:
         return "Corde à droite ↻"
     return "Corde standard"
+
 
 def detecter_etat_terrain(conditions_texte):
     if not conditions_texte:
@@ -83,6 +91,7 @@ def detecter_etat_terrain(conditions_texte):
         )
     return "Bon (Standard)"
 
+
 def _traiter_une_course(session, date_pmu, num_r, hippodrome, course):
     num_c = f"C{course.get('numOrdre')}"
     nom_course = course.get("libelle", "")
@@ -91,7 +100,7 @@ def _traiter_une_course(session, date_pmu, num_r, hippodrome, course):
     terrain_detecte = detecter_etat_terrain(conditions_course)
     corde_detectee = detecter_corde(nom_course, conditions_course)
     distance_val = course.get("distance") or course.get("distanceTotale", "")
-    
+
     heure_str = "13:30"
     valeurs_a_tester = [
         course.get("dateTheoriqueDepart"),
@@ -106,63 +115,73 @@ def _traiter_une_course(session, date_pmu, num_r, hippodrome, course):
                     dt_utc = datetime.datetime.fromtimestamp(
                         val / diviseur, datetime.timezone.utc
                     )
-                    dt_local = dt_utc.astimezone()
+                    dt_local = dt_utc.astimezone(ZoneInfo("Europe/Paris"))
                     heure_str = f"{dt_local.hour:02d}:{dt_local.minute:02d}"
                     break
             except Exception:
                 pass
 
-    url_partants = f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/{date_pmu}/{num_r}/{num_c}/participants"
+    url_partants = (
+        f"https://online.turfinfo.api.pmu.fr/rest/client/7/programme/"
+        f"{date_pmu}/{num_r}/{num_c}/participants"
+    )
     chevaux = []
     try:
         res_part = session.get(url_partants, timeout=10)
         if res_part.status_code == 200:
             data_partants = res_part.json()
-            # Certains flux PMU listent les rapports par type de pari dans une liste globale ou par participant
-            for part_item in data_partants.get("participants", []):
-                rapport_direct = part_item.get("dernierRapportDirect")
-                cote_val = (
-                    rapport_direct.get("rapport")
-                    if isinstance(rapport_direct, dict)
-                    else None
-                )
+            participants = data_partants.get("participants", [])
+            if isinstance(participants, list):
+                for part_item in participants:
+                    statut_part = str(
+                        part_item.get("traductionStatut", part_item.get("statut", ""))
+                    ).upper()
+                    if "NON_PARTANT" in statut_part or part_item.get("nonPartant", False):
+                        continue
 
-                # Recherche d'un rapport placé explicite s'il est présent dans l'objet du participant
-                cote_place_val = None
-                # Si le PMU fournit un tableau de rapports par type de pari pour le participant
-                les_rapports = part_item.get("rapports", [])
-                if isinstance(les_rapports, list):
-                    for rap in les_rapports:
-                        if str(rap.get("typePari", "")).upper() in ["SIMPLE_PLACE", "PLACE"]:
-                            cote_place_val = safe_float(rap.get("rapport", 0))
-                            break
+                    rapport_direct = part_item.get("dernierRapportDirect")
+                    cote_val = (
+                        rapport_direct.get("rapport")
+                        if isinstance(rapport_direct, dict)
+                        else None
+                    )
 
-                rapport_ref = part_item.get("rapportReference")
-                cote_ouv = (
-                    rapport_ref.get("rapport")
-                    if isinstance(rapport_ref, dict)
-                    else cote_val
-                )
+                    cote_place_val = None
+                    les_rapports = part_item.get("rapports", [])
+                    if isinstance(les_rapports, list):
+                        for rap in les_rapports:
+                            if str(rap.get("typePari", "")).upper() in ["SIMPLE_PLACE", "PLACE"]:
+                                cote_place_val = safe_float(rap.get("rapport", 0))
+                                break
 
-                tendance = "stable"
-                if cote_val and cote_ouv:
-                    if cote_val < cote_ouv * 0.85:
-                        tendance = "baisse_forte"
-                    elif cote_val > cote_ouv * 1.15:
-                        tendance = "hausse"
+                    rapport_ref = part_item.get("rapportReference")
+                    cote_ouv = (
+                        rapport_ref.get("rapport")
+                        if isinstance(rapport_ref, dict)
+                        else cote_val
+                    )
 
-                chevaux.append({
-                    "num": part_item.get("numPmu"),
-                    "nom": part_item.get("nom"),
-                    "driver": part_item.get("driver", part_item.get("jockey", "")),
-                    "musique": part_item.get("musique", ""),
-                    "deferre": part_item.get("deferre", ""),
-                    "poids": safe_float(part_item.get("poids", 0.0)),
-                    "cote": cote_val,
-                    "cote_place_reelle": cote_place_val, # Stocke le vrai rapport placé s'il existe
-                    "tendance_cote": tendance,
-                    "ordreArrivee": part_item.get("ordreArrivee"),
-                })
+                    tendance = "stable"
+                    if cote_val and cote_ouv:
+                        if cote_val < cote_ouv * 0.85:
+                            tendance = "baisse_forte"
+                        elif cote_val > cote_ouv * 1.15:
+                            tendance = "hausse"
+
+                    chevaux.append(
+                        {
+                            "num": part_item.get("numPmu"),
+                            "nom": part_item.get("nom"),
+                            "driver": part_item.get("driver", part_item.get("jockey", "")),
+                            "musique": part_item.get("musique", ""),
+                            "deferre": part_item.get("deferre", ""),
+                            "poids": safe_float(part_item.get("poids", 0.0)),
+                            "cote": cote_val,
+                            "cote_place_reelle": cote_place_val,
+                            "tendance_cote": tendance,
+                            "ordreArrivee": part_item.get("ordreArrivee"),
+                        }
+                    )
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des partants pour {num_r} {num_c} : {e}")
 
@@ -179,7 +198,7 @@ def _traiter_une_course(session, date_pmu, num_r, hippodrome, course):
         "chevaux": chevaux,
     }
 
-@st.cache_data
+
 def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
     try:
         dt = datetime.datetime.strptime(date_iso, "%Y-%m-%d")
@@ -194,14 +213,18 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
     try:
         res = session.get(url_programme, timeout=15)
         if res.status_code != 200:
-            logger.warning(f"Impossible de récupérer le programme PMU pour {date_iso} (Code HTTP: {res.status_code})")
+            logger.warning(
+                f"Impossible de récupérer le programme PMU pour {date_iso} "
+                f"(Code HTTP: {res.status_code})"
+            )
             return False
         data = res.json()
     except Exception as e:
         logger.error(f"Erreur réseau lors de l'appel de l'API PMU pour la date {date_iso} : {e}")
         return False
 
-    reunions = data.get("programme", {}).get("reunions", [])
+    programme = data.get("programme", {})
+    reunions = programme.get("reunions", [])
     if not reunions:
         logger.info(f"Aucune réunion trouvée pour la date {date_iso}.")
         return False
@@ -215,18 +238,28 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
 
     total_courses = len(taches_courses)
     resultats_journee = []
-    
-    progress_bar = st.progress(0, text="Téléchargement des programmes en cours (Multi-thread)...") if afficher_progres else None
+
+    progress_bar = (
+        st.progress(0, text="Téléchargement des programmes en cours (Multi-thread)...")
+        if afficher_progres
+        else None
+    )
     courses_terminees = 0
 
     with ThreadPoolExecutor(max_workers=15) as executor:
-        futures = {executor.submit(_traiter_une_course, *tache): tache for tache in taches_courses}
-        
+        futures = {
+            executor.submit(_traiter_une_course, *tache): tache
+            for tache in taches_courses
+        }
+
         for future in as_completed(futures):
             courses_terminees += 1
             if afficher_progres and progress_bar and total_courses > 0:
                 prog_val = min(1.0, courses_terminees / total_courses)
-                progress_bar.progress(prog_val, text=f"Téléchargement parallèle : {courses_terminees}/{total_courses} courses")
+                progress_bar.progress(
+                    prog_val,
+                    text=f"Téléchargement parallèle : {courses_terminees}/{total_courses} courses",
+                )
             try:
                 res_course = future.result()
                 if res_course:
@@ -236,7 +269,7 @@ def telecharger_pmu_date(date_iso, fichier_cible=None, afficher_progres=True):
 
     if afficher_progres and progress_bar:
         progress_bar.empty()
-        
+
     if resultats_journee:
         sauvegarder_courses_jour_db(date_iso, resultats_journee)
         logger.info(f"Téléchargement et mise en cache réussis pour la date {date_iso}.")
